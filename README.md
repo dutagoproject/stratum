@@ -4,6 +4,8 @@
 
 It sits between miners and the daemon mining API, handles worker sessions, distributes jobs, validates shares, and submits block candidates upstream.
 
+Current release line: `0.0.1-beta`
+
 Website: https://dutago.xyz
 
 ## Repository scope
