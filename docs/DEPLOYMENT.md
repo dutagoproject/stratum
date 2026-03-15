@@ -17,7 +17,7 @@ Typical flow:
 ## Important flags
 
 - `--bind`
-  Stratum bind address. Default: `0.0.0.0:11001`
+  Stratum bind address. Default: `127.0.0.1:11001`
 - `--daemon`
   Base URL for the DUTA mining API. Default: `http://127.0.0.1:19085`
 - `--share-bits`
@@ -33,7 +33,7 @@ Typical flow:
 
 ```bash
 ./duta-stratumd \
-  --bind 0.0.0.0:11001 \
+  --bind 127.0.0.1:11001 \
   --daemon http://127.0.0.1:19085 \
   --share-bits 24 \
   --network mainnet
@@ -43,10 +43,23 @@ Typical flow:
 
 ```bash
 ./duta-stratumd \
-  --bind 0.0.0.0:11001 \
+  --bind 127.0.0.1:11001 \
   --daemon http://127.0.0.1:18085 \
   --share-bits 24 \
   --network testnet
+```
+
+## Public bind example
+
+Use a public bind only when you intentionally expose the pool endpoint and already
+have firewall/routing controls in place.
+
+```bash
+./duta-stratumd \
+  --bind 0.0.0.0:11001 \
+  --daemon http://127.0.0.1:19085 \
+  --share-bits 24 \
+  --network mainnet
 ```
 
 ## Miner login format
@@ -69,6 +82,7 @@ The wallet must match the selected network.
 
 - keep the node admin RPC private
 - point stratum to the node mining listener, not the admin RPC
+- keep stratum on loopback until you are ready for explicit public exposure
 - use explicit `--network` if your deployment topology makes inference ambiguous
 - choose `share-bits` based on the hashrate class of your miners
 - watch logs for non-stale reject reasons and repeated reconnect churn

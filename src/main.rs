@@ -18,7 +18,7 @@ use std::{
 };
 use time::{format_description, OffsetDateTime, UtcOffset};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     sync::{OwnedSemaphorePermit, Semaphore},
 };
@@ -27,7 +27,8 @@ use tokio::{
 #[command(
     author,
     version,
-    about = "DUTA stratum bridge for dutad /work + /submit_work"
+    about = "DUTA stratum bridge for dutad /work + /submit_work",
+    after_help = "Examples:\n  duta-stratumd --bind 127.0.0.1:11001 --daemon http://127.0.0.1:19085\n  duta-stratumd --bind 0.0.0.0:11001 --daemon http://127.0.0.1:19085 --network mainnet\n  duta-stratumd --pool-api-url http://127.0.0.1:8080/share --pool-api-key secret-key"
 )]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:11001")]
@@ -247,6 +248,47 @@ const MAX_GETJOB_REQUESTS_PER_WINDOW: u32 = 512;
 const MAX_SUBMIT_REQUESTS_PER_WINDOW: u32 = 768;
 const TEMP_BAN_SECS: u64 = 30;
 const PEER_STATE_TTL_SECS: u64 = 900;
+
+fn validate_http_url(raw: &str, field: &str) -> Result<()> {
+    let url = reqwest::Url::parse(raw).with_context(|| format!("invalid_{}_url", field))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("invalid_{}_url_credentials_not_allowed", field);
+    }
+    match url.scheme() {
+        "http" | "https" => Ok(()),
+        _ => bail!("invalid_{}_url", field),
+    }
+}
+
+fn url_host_is_local(url: &reqwest::Url) -> bool {
+    match url.host_str() {
+        Some(host) if host.eq_ignore_ascii_case("localhost") => true,
+        Some(host) => host
+            .parse::<IpAddr>()
+            .map(|ip| match ip {
+                IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
+                IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local(),
+            })
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+async fn read_line_limited<R>(reader: &mut R, max_bytes: usize) -> Result<Option<Vec<u8>>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line_buf = Vec::new();
+    let mut limited = reader.take((max_bytes + 1) as u64);
+    let read = limited.read_until(b'\n', &mut line_buf).await?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if line_buf.len() > max_bytes {
+        bail!("request_too_large");
+    }
+    Ok(Some(line_buf))
+}
 
 fn cleanup_peer_limits(peer_limits: &mut HashMap<IpAddr, PeerState>, now: Instant) {
     let ttl = Duration::from_secs(PEER_STATE_TTL_SECS);
@@ -1044,11 +1086,21 @@ fn infer_network(args: &Args) -> String {
     }
 }
 
+fn parse_network_arg(network: &str) -> Result<Network> {
+    match network.trim().to_ascii_lowercase().as_str() {
+        "mainnet" => Ok(Network::Mainnet),
+        "testnet" => Ok(Network::Testnet),
+        "stagenet" => Ok(Network::Stagenet),
+        _ => bail!("invalid_network"),
+    }
+}
+
 fn validate_runtime_config(args: &Args) -> Result<()> {
     let bind_addr: std::net::SocketAddr = args
         .bind
         .parse()
         .with_context(|| format!("invalid_bind: {}", args.bind))?;
+    validate_http_url(&args.daemon, "daemon")?;
     if args.share_bits == 0 || args.share_bits > 31 {
         bail!("invalid_share_bits");
     }
@@ -1058,10 +1110,89 @@ fn validate_runtime_config(args: &Args) -> Result<()> {
     if args.job_ttl_secs < args.job_refresh_secs {
         bail!("invalid_job_ttl_secs");
     }
+    match (&args.pool_api_url, &args.pool_api_key) {
+        (Some(_), None) | (None, Some(_)) => bail!("pool_api_requires_url_and_key"),
+        _ => {}
+    }
+    if let Some(url) = args.pool_api_url.as_deref() {
+        validate_http_url(url, "pool_api")?;
+        let parsed =
+            reqwest::Url::parse(url).with_context(|| "invalid_pool_api_url".to_string())?;
+        if parsed.scheme() == "http" && !url_host_is_local(&parsed) {
+            bail!("pool_api_requires_https_for_non_local_host");
+        }
+    }
+    if let Some(network) = args.network.as_deref() {
+        parse_network_arg(network)?;
+    }
     if bind_addr.ip().is_unspecified() {
         log_sys("public bind enabled explicitly by operator");
     }
     Ok(())
+}
+
+async fn verify_daemon_reachable(
+    http: &reqwest::Client,
+    base_url: &str,
+    network: Network,
+) -> Result<()> {
+    let base = base_url.trim_end_matches('/');
+    let health_url = format!("{}/health", base);
+    if let Ok(reply) = http.get(&health_url).send().await {
+        if reply.status().is_success() {
+            return Ok(());
+        }
+        if reply.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            let body = reply.text().await.unwrap_or_default();
+            bail!(
+                "daemon_preflight_syncing: status={} base_url={} health_body={}",
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                base,
+                body
+            );
+        }
+    }
+    let tip_url = format!("{}/tip", base);
+    let tip_reply = http
+        .get(&tip_url)
+        .send()
+        .await
+        .with_context(|| format!("daemon_preflight_failed: GET {}", tip_url))?;
+    if tip_reply.status().is_success() {
+        return Ok(());
+    }
+    let probe_addr = match network {
+        Network::Mainnet => "dut1111111111111111111111111111111111111111",
+        Network::Testnet => "test1111111111111111111111111111111111111111",
+        Network::Stagenet => "stg1111111111111111111111111111111111111111",
+    };
+    let work_url = format!("{}/work?address={}", base, probe_addr);
+    let work_reply = http
+        .get(&work_url)
+        .send()
+        .await
+        .with_context(|| format!("daemon_preflight_failed: GET {}", work_url))?;
+    let work_status = work_reply.status();
+    if work_status.is_success() {
+        return Ok(());
+    }
+    if work_status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        let body = work_reply.text().await.unwrap_or_default();
+        if body.contains("\"syncing\"") || body.contains("syncing") {
+            bail!(
+                "daemon_preflight_syncing: status={} base_url={} work_body={}",
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                base,
+                body
+            );
+        }
+    }
+    bail!(
+        "daemon_preflight_failed: tip_status={} work_status={} base_url={}",
+        tip_reply.status(),
+        work_status,
+        base
+    );
 }
 
 async fn write_json_line(w: &mut tokio::net::tcp::OwnedWriteHalf, v: &Value) -> Result<()> {
@@ -1270,14 +1401,14 @@ async fn send_pool_event(
 async fn submit_candidate(
     app: &App,
     _session_id: &str,
-    worker_id: &str,
+    worker_name: &str,
     job_id: &str,
     work_id: &str,
     nonce: u64,
 ) -> Result<Value> {
     log_cpu(format!(
         "block attempt worker={} job={} work={} nonce={}",
-        worker_tag(worker_id),
+        worker_tag(worker_name),
         job_id,
         short_id(work_id),
         nonce
@@ -1303,7 +1434,7 @@ async fn submit_candidate(
     if status.is_success() {
         log_cpu(format!(
             "block submit accepted worker={} job={} work={} status={} elapsed_ms={}",
-            worker_tag(worker_id),
+            worker_tag(worker_name),
             job_id,
             short_id(work_id),
             status,
@@ -1312,7 +1443,7 @@ async fn submit_candidate(
     } else if !is_stale_reject_reason(&reject_reason) {
         log_cpu(format!(
             "block submit rejected worker={} job={} work={} status={} elapsed_ms={} reason={}",
-            worker_tag(worker_id),
+            worker_tag(worker_name),
             job_id,
             short_id(work_id),
             status,
@@ -1494,10 +1625,10 @@ async fn handle_submit(
     if job.worker_id != worker_id {
         log_err(format!(
             "share rejected worker={} job={} work={} reason=wrong_worker_id expected_worker={}",
-            worker_tag(worker_id),
+            worker_tag(&job.worker_name),
             job_id,
             short_id(&job.work_id),
-            worker_tag(&job.worker_id)
+            worker_tag(&job.worker_name)
         ));
         bail!("wrong_worker_id");
     }
@@ -1520,7 +1651,7 @@ async fn handle_submit(
             );
             log_err(format!(
                 "share rejected worker={} job={} work={} nonce={} reason=invalid_nonce err={}",
-                worker_tag(worker_id),
+                worker_tag(&job.worker_name),
                 job_id,
                 short_id(&job.work_id),
                 nonce_hex,
@@ -1547,7 +1678,7 @@ async fn handle_submit(
             );
             log_err(format!(
                 "share rejected worker={} job={} work={} nonce={} reason=verify_failed err={}",
-                worker_tag(worker_id),
+                worker_tag(&job.worker_name),
                 job_id,
                 short_id(&job.work_id),
                 nonce,
@@ -1583,7 +1714,7 @@ async fn handle_submit(
         let accepted = match submit_candidate(
             app,
             session_id,
-            worker_id,
+            &job.worker_name,
             job_id,
             &job.work_id,
             nonce,
@@ -1601,7 +1732,7 @@ async fn handle_submit(
                 if !is_stale_reject_reason(&reject_reason) {
                     log_err(format!(
                         "block submit failed worker={} job={} work={} nonce={} reason=daemon_reject err={}",
-                        worker_tag(worker_id),
+                        worker_tag(&job.worker_name),
                         job_id,
                         short_id(&job.work_id),
                         nonce,
@@ -1679,7 +1810,7 @@ async fn handle_submit(
         );
         log_err(format!(
             "submit reject worker={} height={} nonce={} reason=low_difficulty hash_bits={} share_bits={}",
-            worker_id,
+            worker_tag(&job.worker_name),
             job.height,
             nonce,
             hash_bits,
@@ -1756,10 +1887,9 @@ async fn handle_client(
     let mut reader = BufReader::new(r);
 
     loop {
-        let mut line_buf = Vec::new();
         let read = tokio::time::timeout(
             Duration::from_secs(CLIENT_IDLE_TIMEOUT_SECS),
-            reader.read_until(b'\n', &mut line_buf),
+            read_line_limited(&mut reader, MAX_STRATUM_LINE_BYTES),
         )
         .await
         .map_err(|_| {
@@ -1768,15 +1898,7 @@ async fn handle_client(
             }
             anyhow!("client_idle_timeout")
         })??;
-        if read == 0 {
-            break;
-        }
-        if line_buf.len() > MAX_STRATUM_LINE_BYTES {
-            if let Some(ip) = peer.and_then(|p| Some(p.ip())) {
-                ban_peer_temporarily(&app, ip);
-            }
-            bail!("request_too_large");
-        }
+        let Some(line_buf) = read else { break; };
         let line = std::str::from_utf8(&line_buf)
             .map_err(|_| {
                 if let Some(ip) = peer.and_then(|p| Some(p.ip())) {
@@ -1852,16 +1974,18 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     validate_runtime_config(&args)?;
     init_logging();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(args.job_refresh_secs.max(5)))
+        .build()
+        .context("build http client")?;
+    verify_daemon_reachable(&http, &args.daemon, parse_network_arg(&infer_network(&args))?).await?;
     let listener = TcpListener::bind(&args.bind)
         .await
         .with_context(|| format!("bind {}", args.bind))?;
 
     let app = App {
         args: args.clone(),
-        http: reqwest::Client::builder()
-            .timeout(Duration::from_secs(args.job_refresh_secs.max(5)))
-            .build()
-            .context("build http client")?,
+        http,
         seq: Arc::new(AtomicU64::new(1)),
         jobs: Arc::new(Mutex::new(HashMap::new())),
         consumed_jobs: Arc::new(Mutex::new(HashMap::new())),
@@ -2067,9 +2191,82 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_requires_complete_pool_api_settings() {
+        let mut args = test_app().args;
+        args.pool_api_url = Some("http://127.0.0.1:8080/share".to_string());
+        assert_eq!(
+            validate_runtime_config(&args).unwrap_err().to_string(),
+            "pool_api_requires_url_and_key"
+        );
+
+        args.pool_api_key = Some("secret".to_string());
+        assert!(validate_runtime_config(&args).is_ok());
+
+        args.pool_api_url = Some("http://pool.example.org/share".to_string());
+        assert_eq!(
+            validate_runtime_config(&args).unwrap_err().to_string(),
+            "pool_api_requires_https_for_non_local_host"
+        );
+
+        args.pool_api_url = Some("https://pool.example.org/share".to_string());
+        assert!(validate_runtime_config(&args).is_ok());
+    }
+
+    #[test]
+    fn runtime_config_rejects_unknown_network_name() {
+        let mut args = test_app().args;
+        args.network = Some("beta".to_string());
+        assert_eq!(
+            validate_runtime_config(&args).unwrap_err().to_string(),
+            "invalid_network"
+        );
+    }
+
+    #[test]
+    fn runtime_config_rejects_invalid_daemon_and_pool_urls() {
+        let mut args = test_app().args;
+        args.daemon = "not-a-url".to_string();
+        assert_eq!(
+            validate_runtime_config(&args).unwrap_err().to_string(),
+            "invalid_daemon_url"
+        );
+
+        args.daemon = "http://127.0.0.1:19085".to_string();
+        args.pool_api_url = Some("ftp://pool.example.org/share".to_string());
+        args.pool_api_key = Some("secret".to_string());
+        assert_eq!(
+            validate_runtime_config(&args).unwrap_err().to_string(),
+            "invalid_pool_api_url"
+        );
+
+        args.pool_api_url = Some("https://user:pass@pool.example.org/share".to_string());
+        assert_eq!(
+            validate_runtime_config(&args).unwrap_err().to_string(),
+            "invalid_pool_api_url_credentials_not_allowed"
+        );
+
+        args.pool_api_url = Some("https://pool.example.org/share".to_string());
+        args.daemon = "http://user:pass@127.0.0.1:19085".to_string();
+        assert_eq!(
+            validate_runtime_config(&args).unwrap_err().to_string(),
+            "invalid_daemon_url_credentials_not_allowed"
+        );
+    }
+
+    #[test]
     fn default_bind_stays_loopback_for_release_safety() {
         let args = Args::parse_from(["stratum"]);
         assert_eq!(args.bind, "127.0.0.1:11001");
+    }
+
+    #[tokio::test]
+    async fn read_line_limited_rejects_oversized_line_without_unbounded_read() {
+        let payload = vec![b'a'; MAX_STRATUM_LINE_BYTES + 32];
+        let mut reader = BufReader::new(std::io::Cursor::new(payload));
+        let err = read_line_limited(&mut reader, MAX_STRATUM_LINE_BYTES)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "request_too_large");
     }
 
     #[test]
