@@ -19,5 +19,6 @@ once_cell = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 duta-core = { path = "../dutad/core" }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
+if-addrs = "0.13"
 
 [workspace]

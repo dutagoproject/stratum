@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use duta_core::{address, dutahash, netparams::Network, types::H32};
+use if_addrs::get_if_addrs;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -253,6 +254,12 @@ const MAX_STRATUM_CONNECTIONS: usize = 256;
 const MAX_STRATUM_LINE_BYTES: usize = 16 * 1024;
 const CLIENT_IDLE_TIMEOUT_SECS: u64 = 10;
 const PRELOGIN_IDLE_TIMEOUT_SECS: u64 = 5;
+const GETJOB_RETRY_ATTEMPTS: usize = 6;
+const GETJOB_RETRY_DELAY_MS: u64 = 1000;
+const TRUSTED_LAUNCH_RETRY_ATTEMPTS: usize = 180;
+const OFFICIAL_POOL_BIND: &str = "0.0.0.0:21001";
+const OFFICIAL_POOL_DAEMON: &str = "http://127.0.0.1:19085";
+const OFFICIAL_POOL_PUBLIC_IP: &str = "213.199.44.138";
 const MAX_CONNECTIONS_PER_IP: usize = 16;
 const MAX_CONNECTIONS_PER_PUBLIC_SUBNET: usize = 32;
 const PEER_REQUEST_WINDOW_SECS: u64 = 10;
@@ -1172,6 +1179,32 @@ fn parse_network_arg(network: &str) -> Result<Network> {
     }
 }
 
+fn trusted_launch_pool_enabled(args: &Args) -> bool {
+    if infer_network(args) != "mainnet" {
+        return false;
+    }
+    if args.bind.trim() != OFFICIAL_POOL_BIND {
+        return false;
+    }
+    if args.daemon.trim_end_matches('/') != OFFICIAL_POOL_DAEMON {
+        return false;
+    }
+    let Ok(addrs) = get_if_addrs() else {
+        return false;
+    };
+    addrs
+        .into_iter()
+        .any(|iface| iface.ip().to_string() == OFFICIAL_POOL_PUBLIC_IP)
+}
+
+fn launch_retry_attempts(args: &Args) -> usize {
+    if trusted_launch_pool_enabled(args) {
+        TRUSTED_LAUNCH_RETRY_ATTEMPTS
+    } else {
+        GETJOB_RETRY_ATTEMPTS
+    }
+}
+
 fn validate_runtime_config(args: &Args) -> Result<()> {
     let bind_addr: std::net::SocketAddr = args
         .bind
@@ -1212,6 +1245,7 @@ async fn verify_daemon_reachable(
     http: &reqwest::Client,
     base_url: &str,
     network: Network,
+    trusted_launch_pool: bool,
 ) -> Result<()> {
     let base = base_url.trim_end_matches('/');
     let health_url = format!("{}/health", base);
@@ -1251,6 +1285,11 @@ async fn verify_daemon_reachable(
         return Ok(());
     }
     if work_status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        if trusted_launch_pool
+            && (body.contains("launch_guard_not_ready") || body.contains("launch_guard_"))
+        {
+            return Ok(());
+        }
         if body.contains("\"syncing\"") || body.contains("syncing") {
             bail!(
                 "daemon_preflight_syncing: status={} base_url={} work_body={}",
@@ -1568,27 +1607,54 @@ async fn handle_login(
         &worker_name,
         peer_label,
     );
-    let job = match fetch_work(
-        app,
-        &wallet,
-        &worker_name,
-        &worker_id,
-        session_id,
-        peer_label,
-    )
-    .await
-    {
-        Ok(job) => job,
-        Err(e) => {
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut job_opt = None;
+    let retry_attempts = launch_retry_attempts(&app.args);
+    for attempt in 0..retry_attempts {
+        match fetch_work(
+            app,
+            &wallet,
+            &worker_name,
+            &worker_id,
+            session_id,
+            peer_label,
+        )
+        .await
+        {
+            Ok(job) => {
+                job_opt = Some(job);
+                break;
+            }
+            Err(e) => {
+                let err_text = e.to_string();
+                let retryable = err_text.contains("launch_guard") || err_text.contains("syncing");
+                last_err = Some(e);
+                if !retryable || attempt + 1 >= retry_attempts {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(GETJOB_RETRY_DELAY_MS)).await;
+            }
+        }
+    }
+    let job = match job_opt {
+        Some(job) => job,
+        None => {
             unregister_worker(app, &worker_id);
+            let err = last_err.unwrap_or_else(|| anyhow!("work_fetch_failed"));
+            let err_text = err.to_string();
+            let surfaced = if err_text.contains("launch_guard") || err_text.contains("syncing") {
+                anyhow!("syncing")
+            } else {
+                err
+            };
             log_err(format!(
                 "login rejected peer={} wallet={} worker={} reason=work_fetch_failed err={}",
                 short_peer_label(peer_label),
                 short_wallet(&wallet),
                 worker_tag(&worker_name),
-                e
+                surfaced
             ));
-            return Err(e);
+            return Err(surfaced);
         }
     };
     insert_recent_job(app, job.clone(), Duration::from_secs(app.args.job_ttl_secs));
@@ -1639,15 +1705,37 @@ async fn handle_getjob(app: &App, session_id: &str, params: &Value) -> Result<Va
             .unwrap_or_else(|| "-".to_string())
     };
 
-    let job = fetch_work(
-        app,
-        &wallet,
-        &worker_name,
-        worker_id,
-        session_id,
-        &peer_label,
-    )
-    .await?;
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut job_opt = None;
+    let retry_attempts = launch_retry_attempts(&app.args);
+    for attempt in 0..retry_attempts {
+        match fetch_work(app, &wallet, &worker_name, worker_id, session_id, &peer_label).await {
+            Ok(job) => {
+                job_opt = Some(job);
+                break;
+            }
+            Err(e) => {
+                let err_text = e.to_string();
+                let retryable = err_text.contains("launch_guard") || err_text.contains("syncing");
+                last_err = Some(e);
+                if !retryable || attempt + 1 >= retry_attempts {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(GETJOB_RETRY_DELAY_MS)).await;
+            }
+        }
+    }
+    let job = match job_opt {
+        Some(job) => job,
+        None => {
+            let err = last_err.unwrap_or_else(|| anyhow!("work_fetch_failed"));
+            let err_text = err.to_string();
+            if err_text.contains("launch_guard") || err_text.contains("syncing") {
+                return Err(anyhow!("syncing"));
+            }
+            return Err(err);
+        }
+    };
     insert_recent_job(app, job.clone(), Duration::from_secs(app.args.job_ttl_secs));
     log_job(format!(
         "assigned work peer={} wallet={} worker={} height={} block_bits={} share_bits={} job={} work={}",
@@ -2099,7 +2187,13 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(args.job_refresh_secs.max(5)))
         .build()
         .context("build http client")?;
-    verify_daemon_reachable(&http, &args.daemon, parse_network_arg(&infer_network(&args))?).await?;
+    verify_daemon_reachable(
+        &http,
+        &args.daemon,
+        parse_network_arg(&infer_network(&args))?,
+        trusted_launch_pool_enabled(&args),
+    )
+    .await?;
     let listener = TcpListener::bind(&args.bind)
         .await
         .with_context(|| format!("bind {}", args.bind))?;
@@ -2129,6 +2223,9 @@ async fn main() -> Result<()> {
         args.job_ttl_secs,
         args.pool_api_url.as_deref().unwrap_or("-")
     ));
+    if trusted_launch_pool_enabled(&args) {
+        log_sys("trusted launch pool mode enabled");
+    }
 
     loop {
         tokio::select! {
