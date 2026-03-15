@@ -11,7 +11,7 @@ This guide is for producing the Linux stratum server binary for packaging and de
 From the repository root:
 
 ```bash
-cargo build --release --bin duta-stratumd
+./scripts/build-linux.sh
 ```
 
 ## Output
@@ -28,6 +28,12 @@ Check the available flags before packaging or deploying:
 
 ```bash
 ./target/release/duta-stratumd --help
+```
+
+## Run
+
+```bash
+./scripts/run-stratum.sh http://127.0.0.1:19085 127.0.0.1:11001
 ```
 
 ## Next step

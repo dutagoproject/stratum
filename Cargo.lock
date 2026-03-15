@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "duta-core"
-version = "0.0.1-beta"
+version = "1.0.0"
 dependencies = [
  "hex",
  "sha3",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "duta-stratumd"
-version = "0.0.1-beta"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",

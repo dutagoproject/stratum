@@ -1,6 +1,6 @@
 # Build duta-stratumd on Windows
 
-This guide is for producing the Windows stratum server binary for packaging and deployment.
+This guide is for producing the Windows stratum server binary without using PowerShell.
 
 ## Requirements
 
@@ -11,8 +11,8 @@ This guide is for producing the Windows stratum server binary for packaging and 
 
 From the repository root:
 
-```powershell
-cargo build --release --bin duta-stratumd
+```bat
+scripts\build-windows.cmd
 ```
 
 ## Output
@@ -27,8 +27,14 @@ target\release\duta-stratumd.exe
 
 Check the available flags before packaging or deploying:
 
-```powershell
-.\target\release\duta-stratumd.exe --help
+```bat
+target\release\duta-stratumd.exe --help
+```
+
+## Run
+
+```bat
+scripts\run-stratum.cmd http://127.0.0.1:19085 127.0.0.1:11001
 ```
 
 ## Next step
