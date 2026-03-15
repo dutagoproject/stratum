@@ -175,6 +175,7 @@ struct App {
     stats: Arc<Mutex<HashMap<String, WorkerStats>>>,
     conn_limit: Arc<Semaphore>,
     peer_limits: Arc<Mutex<HashMap<IpAddr, PeerState>>>,
+    subnet_limits: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -207,7 +208,9 @@ impl PeerState {
 #[derive(Debug)]
 struct PeerConnectionGuard {
     peer_limits: Arc<Mutex<HashMap<IpAddr, PeerState>>>,
+    subnet_limits: Arc<Mutex<HashMap<String, usize>>>,
     ip: IpAddr,
+    subnet_key: Option<String>,
 }
 
 impl Drop for PeerConnectionGuard {
@@ -219,6 +222,15 @@ impl Drop for PeerConnectionGuard {
             state.last_seen_at = now;
         }
         cleanup_peer_limits(&mut peer_limits, now);
+        if let Some(subnet_key) = self.subnet_key.as_ref() {
+            let mut subnet_limits = lock_or_recover(&self.subnet_limits, "subnet_limits");
+            if let Some(open) = subnet_limits.get_mut(subnet_key) {
+                *open = open.saturating_sub(1);
+                if *open == 0 {
+                    subnet_limits.remove(subnet_key);
+                }
+            }
+        }
     }
 }
 
@@ -237,10 +249,12 @@ const OPERATOR_SNAPSHOT_SECS: u64 = 30;
 const MAX_LOGIN_BYTES: usize = 192;
 const MAX_WORKER_NAME_BYTES: usize = 64;
 const CONSUMED_JOB_TTL_SECS: u64 = 30;
-const MAX_STRATUM_CONNECTIONS: usize = 512;
+const MAX_STRATUM_CONNECTIONS: usize = 256;
 const MAX_STRATUM_LINE_BYTES: usize = 16 * 1024;
-const CLIENT_IDLE_TIMEOUT_SECS: u64 = 15;
-const MAX_CONNECTIONS_PER_IP: usize = 64;
+const CLIENT_IDLE_TIMEOUT_SECS: u64 = 10;
+const PRELOGIN_IDLE_TIMEOUT_SECS: u64 = 5;
+const MAX_CONNECTIONS_PER_IP: usize = 16;
+const MAX_CONNECTIONS_PER_PUBLIC_SUBNET: usize = 32;
 const PEER_REQUEST_WINDOW_SECS: u64 = 10;
 const MAX_REQUESTS_PER_WINDOW: u32 = 1024;
 const MAX_LOGIN_REQUESTS_PER_WINDOW: u32 = 64;
@@ -298,6 +312,20 @@ fn cleanup_peer_limits(peer_limits: &mut HashMap<IpAddr, PeerState>, now: Instan
     });
 }
 
+fn public_subnet24_key(ip: IpAddr) -> Option<String> {
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_private() || v4.is_loopback() || v4.is_link_local() {
+                None
+            } else {
+                let oct = v4.octets();
+                Some(format!("{}.{}.{}", oct[0], oct[1], oct[2]))
+            }
+        }
+        IpAddr::V6(_) => None,
+    }
+}
+
 fn apply_temporary_peer_ban(state: &mut PeerState, now: Instant) {
     state.ban_until = Some(now + Duration::from_secs(TEMP_BAN_SECS));
     state.window_started_at = now;
@@ -329,10 +357,22 @@ fn try_open_peer_connection(app: &App, ip: IpAddr) -> Result<PeerConnectionGuard
         apply_temporary_peer_ban(state, now);
         bail!("too_many_connections_per_ip");
     }
+    let subnet_key = public_subnet24_key(ip);
+    if let Some(subnet_key) = subnet_key.as_ref() {
+        let mut subnet_limits = lock_or_recover(&app.subnet_limits, "subnet_limits");
+        let open = subnet_limits.entry(subnet_key.clone()).or_insert(0);
+        if *open >= MAX_CONNECTIONS_PER_PUBLIC_SUBNET {
+            apply_temporary_peer_ban(state, now);
+            bail!("too_many_connections_per_public_subnet");
+        }
+        *open += 1;
+    }
     state.open_connections += 1;
     Ok(PeerConnectionGuard {
         peer_limits: Arc::clone(&app.peer_limits),
+        subnet_limits: Arc::clone(&app.subnet_limits),
         ip,
+        subnet_key,
     })
 }
 
@@ -806,6 +846,8 @@ fn canonical_stratum_error(err_text: &str) -> &'static str {
         "unknown_method"
     } else if err_text == "missing_method" {
         "missing_method"
+    } else if err_text.starts_with("launch_guard") {
+        "launch_guard"
     } else if matches!(
         err_text,
         "unknown_job"
@@ -858,6 +900,31 @@ fn canonical_submit_reject_reason(reply: &Value) -> String {
         .or_else(|| reply.get("error").and_then(|v| v.as_str()))
         .map(|s| canonical_stratum_error(s).to_string())
         .unwrap_or_else(|| "daemon_reject".to_string())
+}
+
+fn canonical_work_fetch_reject_reason(status: reqwest::StatusCode, body: &str) -> &'static str {
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        if body.contains("launch_guard_not_ready") || body.contains("launch_guard_") {
+            return "launch_guard";
+        }
+        if body.contains("\"syncing\"") || body.contains("syncing") {
+            return "syncing";
+        }
+        if body.contains("\"busy\"") || body.contains("busy") {
+            return "busy";
+        }
+    }
+    if body.contains("too_many_outstanding_work") {
+        return "busy";
+    }
+    "work_fetch_failed"
+}
+
+fn should_ban_for_client_error(err_text: &str) -> bool {
+    matches!(
+        err_text,
+        "client_idle_timeout" | "invalid_utf8" | "request_too_large" | "peer_rate_limited"
+    )
 }
 
 fn is_stale_error_text(message: &str) -> bool {
@@ -1236,15 +1303,17 @@ async fn fetch_work(
     if !reply.status().is_success() {
         let status = reply.status();
         let body = reply.text().await.unwrap_or_default();
+        let reason = canonical_work_fetch_reject_reason(status, &body);
         log_err(format!(
-            "work fetch failed wallet={} worker={} peer={} status={} body={}",
+            "work fetch failed wallet={} worker={} peer={} status={} reason={} body={}",
             short_wallet(wallet),
             worker_tag(worker_name),
             short_peer_label(peer_label),
             status,
+            reason,
             body
         ));
-        bail!("work fetch failed: status={} body={}", status, body);
+        bail!("{}", reason);
     }
 
     let work: WorkReply = reply.json().await.context("decode /work reply")?;
@@ -1885,28 +1954,60 @@ async fn handle_client(
     let session_id = format!("s{:016x}", app.seq.fetch_add(1, Ordering::Relaxed));
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
+    let mut authenticated = false;
 
     loop {
-        let read = tokio::time::timeout(
-            Duration::from_secs(CLIENT_IDLE_TIMEOUT_SECS),
+        let idle_timeout_secs = if authenticated {
+            CLIENT_IDLE_TIMEOUT_SECS
+        } else {
+            PRELOGIN_IDLE_TIMEOUT_SECS
+        };
+        let read = match tokio::time::timeout(
+            Duration::from_secs(idle_timeout_secs),
             read_line_limited(&mut reader, MAX_STRATUM_LINE_BYTES),
         )
         .await
-        .map_err(|_| {
-            if let Some(ip) = peer.and_then(|p| Some(p.ip())) {
-                ban_peer_temporarily(&app, ip);
+        {
+            Ok(Ok(read)) => read,
+            Ok(Err(e)) => {
+                let err_text = e.to_string();
+                if should_ban_for_client_error(&err_text) {
+                    if let Some(ip) = peer.and_then(|p| Some(p.ip())) {
+                        ban_peer_temporarily(&app, ip);
+                    }
+                }
+                log_err(format!(
+                    "disconnect peer={} reason={}",
+                    short_peer_label(&peer_label),
+                    err_text
+                ));
+                return Err(e);
             }
-            anyhow!("client_idle_timeout")
-        })??;
-        let Some(line_buf) = read else { break; };
-        let line = std::str::from_utf8(&line_buf)
-            .map_err(|_| {
+            Err(_) => {
                 if let Some(ip) = peer.and_then(|p| Some(p.ip())) {
                     ban_peer_temporarily(&app, ip);
                 }
-                anyhow!("invalid_utf8")
-            })?
-            .trim();
+                log_err(format!(
+                    "disconnect peer={} reason=client_idle_timeout",
+                    short_peer_label(&peer_label)
+                ));
+                bail!("client_idle_timeout");
+            }
+        };
+        let Some(line_buf) = read else { break; };
+        let line = match std::str::from_utf8(&line_buf) {
+            Ok(line) => line.trim(),
+            Err(_) => {
+                if let Some(ip) = peer.and_then(|p| Some(p.ip())) {
+                    ban_peer_temporarily(&app, ip);
+                }
+                log_err(format!(
+                    "disconnect peer={} reason=invalid_utf8",
+                    short_peer_label(&peer_label)
+                ));
+                bail!("invalid_utf8");
+            }
+        };
         if line.is_empty() {
             continue;
         }
@@ -1930,7 +2031,15 @@ async fn handle_client(
 
         let method_name = msg.method.as_deref().unwrap_or("<missing>");
         if let Some(ip) = peer.and_then(|p| Some(p.ip())) {
-            enforce_peer_rate_limit(&app, ip, method_name)?;
+            if let Err(e) = enforce_peer_rate_limit(&app, ip, method_name) {
+                log_err(format!(
+                    "disconnect peer={} method={} reason={}",
+                    short_peer_label(&peer_label),
+                    method_name,
+                    e
+                ));
+                return Err(e);
+            }
         }
         let response = match msg.method.as_deref() {
             Some("login") => handle_login(&app, &session_id, &peer_label, &msg.params).await,
@@ -1941,7 +2050,12 @@ async fn handle_client(
         };
 
         let out = match response {
-            Ok(result) => json!({"id": msg.id, "result": result, "error": Value::Null}),
+            Ok(result) => {
+                if msg.method.as_deref() == Some("login") {
+                    authenticated = true;
+                }
+                json!({"id": msg.id, "result": result, "error": Value::Null})
+            }
             Err(e) => {
                 let err_text = e.to_string();
                 let reason = canonical_stratum_error(&err_text);
@@ -1993,6 +2107,7 @@ async fn main() -> Result<()> {
         stats: Arc::new(Mutex::new(HashMap::new())),
         conn_limit: Arc::new(Semaphore::new(MAX_STRATUM_CONNECTIONS)),
         peer_limits: Arc::new(Mutex::new(HashMap::new())),
+        subnet_limits: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let mut operator_tick = tokio::time::interval(Duration::from_secs(OPERATOR_SNAPSHOT_SECS));
@@ -2086,6 +2201,7 @@ mod tests {
             stats: Arc::new(Mutex::new(HashMap::new())),
             conn_limit: Arc::new(Semaphore::new(MAX_STRATUM_CONNECTIONS)),
             peer_limits: Arc::new(Mutex::new(HashMap::new())),
+            subnet_limits: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -2144,6 +2260,10 @@ mod tests {
         assert_eq!(canonical_stratum_error("pow_invalid"), "low_difficulty");
         assert_eq!(canonical_stratum_error("syncing"), "syncing");
         assert_eq!(canonical_stratum_error("busy"), "busy");
+        assert_eq!(
+            canonical_stratum_error("launch_guard_not_ready"),
+            "launch_guard"
+        );
         assert_eq!(canonical_stratum_error("blob_too_short"), "request_failed");
     }
 
@@ -2164,6 +2284,38 @@ mod tests {
         assert_eq!(
             canonical_submit_reject_reason(&json!({"detail":"opaque"})),
             "daemon_reject"
+        );
+    }
+
+    #[test]
+    fn work_fetch_reject_reason_prefers_launch_guard_and_syncing() {
+        assert_eq!(
+            canonical_work_fetch_reject_reason(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"launch_guard_not_ready","detail":"launch_guard_syncing tip_height=10 best_seen_height=12"}"#
+            ),
+            "launch_guard"
+        );
+        assert_eq!(
+            canonical_work_fetch_reject_reason(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"syncing","detail":"syncing tip_height=10 best_seen_height=12"}"#
+            ),
+            "syncing"
+        );
+        assert_eq!(
+            canonical_work_fetch_reject_reason(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"busy"}"#
+            ),
+            "busy"
+        );
+        assert_eq!(
+            canonical_work_fetch_reject_reason(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":"too_many_outstanding_work"}"#
+            ),
+            "busy"
         );
     }
 
@@ -2295,6 +2447,15 @@ mod tests {
     }
 
     #[test]
+    fn abuse_disconnect_errors_are_ban_eligible() {
+        assert!(should_ban_for_client_error("client_idle_timeout"));
+        assert!(should_ban_for_client_error("invalid_utf8"));
+        assert!(should_ban_for_client_error("request_too_large"));
+        assert!(should_ban_for_client_error("peer_rate_limited"));
+        assert!(!should_ban_for_client_error("missing_method"));
+    }
+
+    #[test]
     fn peer_connection_limit_is_enforced_per_ip() {
         let app = test_app();
         let ip: IpAddr = "127.0.0.1".parse().expect("ip");
@@ -2314,6 +2475,19 @@ mod tests {
         ban_peer_temporarily(&app, ip);
         let err = try_open_peer_connection(&app, ip).unwrap_err();
         assert_eq!(err.to_string(), "peer_temporarily_banned");
+    }
+
+    #[test]
+    fn public_subnet_connection_limit_is_enforced() {
+        let app = test_app();
+        let mut guards = Vec::new();
+        for idx in 1..=MAX_CONNECTIONS_PER_PUBLIC_SUBNET {
+            let ip: IpAddr = format!("8.8.8.{}", idx).parse().expect("ip");
+            guards.push(try_open_peer_connection(&app, ip).expect("within subnet limit"));
+        }
+        let err = try_open_peer_connection(&app, "8.8.8.250".parse().unwrap()).unwrap_err();
+        assert_eq!(err.to_string(), "too_many_connections_per_public_subnet");
+        drop(guards);
     }
 
     #[test]

@@ -1,8 +1,8 @@
 # duta-stratumd Deployment Guide
 
-This guide covers the public operator-facing behavior of the DUTA stratum server.
+This guide covers how to run the DUTA stratum server without guessing what should connect to what.
 
-## Role in the stack
+## Where it sits in the stack
 
 `duta-stratumd` does not produce block templates by itself.
 It depends on a DUTA node mining endpoint and distributes jobs to miners over stratum.
@@ -51,8 +51,7 @@ Typical flow:
 
 ## Public bind example
 
-Use a public bind only when you intentionally expose the pool endpoint and already
-have firewall/routing controls in place.
+Use a public bind only when you actually intend to expose the pool endpoint and already have firewall and routing controls in place.
 
 ```bash
 ./duta-stratumd \
@@ -82,12 +81,12 @@ The wallet must match the selected network.
 
 - keep the node admin RPC private
 - point stratum to the node mining listener, not the admin RPC
-- keep stratum on loopback until you are ready for explicit public exposure
-- use explicit `--network` if your deployment topology makes inference ambiguous
+- keep stratum on loopback until you are ready for public exposure
+- use explicit `--network` if your deployment makes auto-detection unclear
 - choose `share-bits` based on the hashrate class of your miners
-- watch logs for non-stale reject reasons and repeated reconnect churn
+- watch logs for non-stale rejects and repeated reconnect churn
 
-## Expected logging
+## What normal logging looks like
 
 Normal logs include:
 
@@ -97,7 +96,7 @@ Normal logs include:
 - block found
 - miner disconnected
 
-Stale reject spam is intentionally suppressed because it is normal around block turnover.
+Repeated stale-share spam is intentionally suppressed because it is normal around block turnover.
 
 ## Common mistakes
 

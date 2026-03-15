@@ -1,6 +1,7 @@
 # duta-stratumd 0.0.1-beta
 
 This is the first public beta release of the DUTA stratum server.
+It is for operators who want to run a public or private stratum endpoint against a DUTA node.
 
 ## Highlights
 
@@ -47,6 +48,6 @@ If a checksum file is attached to the release, verify it before deployment.
 
 ## Notes for this beta
 
-This release is intended for operators who are comfortable running public mining infrastructure.
+This release is intended for operators who are comfortable running public mining infrastructure and reviewing logs, bind settings, and upstream node health.
 
 For deployment and security notes, see the repository documentation.
