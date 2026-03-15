@@ -869,6 +869,8 @@ fn canonical_stratum_error(err_text: &str) -> &'static str {
         "invalid_share"
     } else if err_text == "busy" {
         "busy"
+    } else if err_text == "rate_limited" {
+        "rate_limited"
     } else if err_text == "syncing" {
         "syncing"
     } else {
@@ -912,6 +914,14 @@ fn canonical_work_fetch_reject_reason(status: reqwest::StatusCode, body: &str) -
         }
         if body.contains("\"busy\"") || body.contains("busy") {
             return "busy";
+        }
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        if body.contains("\"rate_limited\"") || body.contains("rate_limited") {
+            return "rate_limited";
+        }
+        if body.contains("retry_after_secs") {
+            return "rate_limited";
         }
     }
     if body.contains("too_many_outstanding_work") {
@@ -1800,11 +1810,12 @@ async fn handle_submit(
                     .unwrap_or_else(|| canonical_stratum_error(&e.to_string()).to_string());
                 if !is_stale_reject_reason(&reject_reason) {
                     log_err(format!(
-                        "block submit failed worker={} job={} work={} nonce={} reason=daemon_reject err={}",
+                        "block submit failed worker={} job={} work={} nonce={} reason={} err={}",
                         worker_tag(&job.worker_name),
                         job_id,
                         short_id(&job.work_id),
                         nonce,
+                        reject_reason,
                         e
                     ));
                 }
@@ -1814,12 +1825,12 @@ async fn handle_submit(
                     &job,
                     false,
                     true,
-                    Some(reject_reason),
+                    Some(reject_reason.clone()),
                     None,
                     Some(json!({"nonce": nonce, "result": result_hex, "error": e.to_string()})),
                 )
                 .await;
-                return Err(e);
+                return Err(anyhow!(reject_reason));
             }
         };
         let block_hash = accepted
@@ -2260,6 +2271,7 @@ mod tests {
         assert_eq!(canonical_stratum_error("pow_invalid"), "low_difficulty");
         assert_eq!(canonical_stratum_error("syncing"), "syncing");
         assert_eq!(canonical_stratum_error("busy"), "busy");
+        assert_eq!(canonical_stratum_error("rate_limited"), "rate_limited");
         assert_eq!(
             canonical_stratum_error("launch_guard_not_ready"),
             "launch_guard"
@@ -2309,6 +2321,13 @@ mod tests {
                 r#"{"error":"busy"}"#
             ),
             "busy"
+        );
+        assert_eq!(
+            canonical_work_fetch_reject_reason(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":"rate_limited","retry_after_secs":1}"#
+            ),
+            "rate_limited"
         );
         assert_eq!(
             canonical_work_fetch_reject_reason(
