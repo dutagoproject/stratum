@@ -1269,8 +1269,11 @@ async fn verify_daemon_reachable(
         Network::Stagenet => "stg1111111111111111111111111111111111111111",
     };
     let work_url = format!("{}/work?address={}", base, probe_addr);
-    let work_reply = http
-        .get(&work_url)
+    let mut work_req = http.get(&work_url);
+    if trusted_launch_pool {
+        work_req = work_req.header("x-duta-work-source", "official-stratum");
+    }
+    let work_reply = work_req
         .send()
         .await
         .with_context(|| format!("daemon_preflight_failed: GET {}", work_url))?;
@@ -1338,9 +1341,11 @@ async fn fetch_work(
             wallet
         )
     };
-    let reply = app
-        .http
-        .get(&url)
+    let mut req = app.http.get(&url);
+    if trusted_launch_pool_enabled(&app.args) {
+        req = req.header("x-duta-work-source", "official-stratum");
+    }
+    let reply = req
         .send()
         .await
         .with_context(|| format!("GET {}", url))?;
