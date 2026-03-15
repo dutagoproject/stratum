@@ -1229,15 +1229,6 @@ async fn verify_daemon_reachable(
             );
         }
     }
-    let tip_url = format!("{}/tip", base);
-    let tip_reply = http
-        .get(&tip_url)
-        .send()
-        .await
-        .with_context(|| format!("daemon_preflight_failed: GET {}", tip_url))?;
-    if tip_reply.status().is_success() {
-        return Ok(());
-    }
     let probe_addr = match network {
         Network::Mainnet => "dut1111111111111111111111111111111111111111",
         Network::Testnet => "test1111111111111111111111111111111111111111",
@@ -1253,8 +1244,13 @@ async fn verify_daemon_reachable(
     if work_status.is_success() {
         return Ok(());
     }
+    let body = work_reply.text().await.unwrap_or_default();
+    if work_status == reqwest::StatusCode::BAD_REQUEST
+        && (body.contains("\"invalid_address\"") || body.contains("invalid_address"))
+    {
+        return Ok(());
+    }
     if work_status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-        let body = work_reply.text().await.unwrap_or_default();
         if body.contains("\"syncing\"") || body.contains("syncing") {
             bail!(
                 "daemon_preflight_syncing: status={} base_url={} work_body={}",
@@ -1265,10 +1261,10 @@ async fn verify_daemon_reachable(
         }
     }
     bail!(
-        "daemon_preflight_failed: tip_status={} work_status={} base_url={}",
-        tip_reply.status(),
+        "daemon_preflight_failed: work_status={} base_url={} work_body={}",
         work_status,
-        base
+        base,
+        body
     );
 }
 
