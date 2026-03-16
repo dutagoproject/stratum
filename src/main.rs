@@ -958,12 +958,14 @@ fn is_stale_reject_reason(reason: &str) -> bool {
 
 fn unregister_session(app: &App, session_id: &str) -> usize {
     let mut removed = 0usize;
+    let mut removed_workers: Vec<String> = Vec::new();
     {
         let mut workers = lock_or_recover(&app.workers, "workers");
-        workers.retain(|_, worker| {
+        workers.retain(|worker_id, worker| {
             let keep = worker.session_id != session_id;
             if !keep {
                 removed += 1;
+                removed_workers.push(worker_id.clone());
             }
             keep
         });
@@ -971,6 +973,17 @@ fn unregister_session(app: &App, session_id: &str) -> usize {
     {
         let mut stats = lock_or_recover(&app.stats, "stats");
         stats.retain(|_, stat| stat.session_id != session_id);
+    }
+    if removed > 0 {
+        let mut jobs = lock_or_recover(&app.jobs, "jobs");
+        jobs.retain(|_, job| job.session_id != session_id);
+    }
+    if !removed_workers.is_empty() {
+        let mut consumed = lock_or_recover(&app.consumed_jobs, "consumed_jobs");
+        consumed.retain(|_, job| {
+            job.session_id != session_id
+                && !removed_workers.iter().any(|worker_id| worker_id == &job.worker_id)
+        });
     }
     removed
 }
@@ -1587,6 +1600,7 @@ async fn handle_login(
             return Err(e);
         }
     };
+    let _ = unregister_session(app, session_id);
     let worker_id = format!(
         "{}-{:016x}",
         session_id,
@@ -2607,6 +2621,70 @@ mod tests {
 
         let err = session_job_lookup(&app, "s1", "w1", "job-1").unwrap_err();
         assert_eq!(err.to_string(), "stale_job");
+    }
+
+    #[test]
+    fn unregister_session_clears_worker_stats_jobs_and_consumed_state() {
+        let app = test_app();
+        let now = Instant::now();
+        lock_or_recover(&app.workers, "workers").insert(
+            "w1".to_string(),
+            WorkerState {
+                session_id: "s1".to_string(),
+                wallet: "dut1".to_string(),
+                worker_name: "rig1".to_string(),
+            },
+        );
+        lock_or_recover(&app.stats, "stats").insert(
+            "w1".to_string(),
+            WorkerStats {
+                session_id: "s1".to_string(),
+                wallet: "dut1".to_string(),
+                worker_name: "rig1".to_string(),
+                peer_label: "127.0.0.1".to_string(),
+                connected: true,
+                last_job_at: now,
+                last_share_at: None,
+                accepted_shares: 0,
+                rejected_shares: 0,
+                candidate_blocks: 0,
+                best_hash_bits: 0,
+                last_error: None,
+                share_samples: VecDeque::new(),
+            },
+        );
+        lock_or_recover(&app.jobs, "jobs").insert(
+            "job-1".to_string(),
+            WorkJob {
+                job_id: "job-1".to_string(),
+                session_id: "s1".to_string(),
+                worker_name: "rig1".to_string(),
+                worker_id: "w1".to_string(),
+                wallet: "dut1".to_string(),
+                work_id: "work-1".to_string(),
+                blob: "00".repeat(80),
+                height: 10,
+                bits: 24,
+                share_bits: 24,
+                anchor_hash32: "00".repeat(32),
+                target: "ff".repeat(32),
+                created_at: now,
+            },
+        );
+        lock_or_recover(&app.consumed_jobs, "consumed_jobs").insert(
+            "job-2".to_string(),
+            ConsumedJob {
+                session_id: "s1".to_string(),
+                worker_id: "w1".to_string(),
+                consumed_at: now,
+            },
+        );
+
+        assert_eq!(unregister_session(&app, "s1"), 1);
+        assert!(lock_or_recover(&app.workers, "workers").is_empty());
+        assert!(lock_or_recover(&app.stats, "stats").is_empty());
+        assert!(lock_or_recover(&app.jobs, "jobs").is_empty());
+        assert!(lock_or_recover(&app.consumed_jobs, "consumed_jobs").is_empty());
     }
 
     #[test]
