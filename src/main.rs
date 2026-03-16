@@ -1539,6 +1539,7 @@ async fn submit_candidate(
     let reply = app
         .http
         .post(&url)
+        .header("x-duta-work-source", "official-stratum")
         .json(&SubmitReq {
             work_id: work_id.to_string(),
             nonce,
