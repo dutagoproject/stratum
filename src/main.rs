@@ -252,11 +252,8 @@ const MAX_WORKER_NAME_BYTES: usize = 64;
 const CONSUMED_JOB_TTL_SECS: u64 = 30;
 const MAX_STRATUM_CONNECTIONS: usize = 256;
 const MAX_STRATUM_LINE_BYTES: usize = 16 * 1024;
-const CLIENT_IDLE_TIMEOUT_SECS: u64 = 10;
+const CLIENT_IDLE_TIMEOUT_SECS: u64 = 30;
 const PRELOGIN_IDLE_TIMEOUT_SECS: u64 = 5;
-const GETJOB_RETRY_ATTEMPTS: usize = 6;
-const GETJOB_RETRY_DELAY_MS: u64 = 1000;
-const TRUSTED_LAUNCH_RETRY_ATTEMPTS: usize = 180;
 const OFFICIAL_POOL_BIND: &str = "0.0.0.0:21001";
 const OFFICIAL_POOL_DAEMON: &str = "http://127.0.0.1:19085";
 const OFFICIAL_POOL_PUBLIC_IP: &str = "213.199.44.138";
@@ -1197,14 +1194,6 @@ fn trusted_launch_pool_enabled(args: &Args) -> bool {
         .any(|iface| iface.ip().to_string() == OFFICIAL_POOL_PUBLIC_IP)
 }
 
-fn launch_retry_attempts(args: &Args) -> usize {
-    if trusted_launch_pool_enabled(args) {
-        TRUSTED_LAUNCH_RETRY_ATTEMPTS
-    } else {
-        GETJOB_RETRY_ATTEMPTS
-    }
-}
-
 fn validate_runtime_config(args: &Args) -> Result<()> {
     let bind_addr: std::net::SocketAddr = args
         .bind
@@ -1612,74 +1601,60 @@ async fn handle_login(
         &worker_name,
         peer_label,
     );
-    let mut last_err: Option<anyhow::Error> = None;
-    let mut job_opt = None;
-    let retry_attempts = launch_retry_attempts(&app.args);
-    for attempt in 0..retry_attempts {
-        match fetch_work(
-            app,
-            &wallet,
-            &worker_name,
-            &worker_id,
-            session_id,
-            peer_label,
-        )
-        .await
-        {
-            Ok(job) => {
-                job_opt = Some(job);
-                break;
-            }
-            Err(e) => {
-                let err_text = e.to_string();
-                let retryable = err_text.contains("launch_guard") || err_text.contains("syncing");
-                last_err = Some(e);
-                if !retryable || attempt + 1 >= retry_attempts {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(GETJOB_RETRY_DELAY_MS)).await;
-            }
+    match fetch_work(
+        app,
+        &wallet,
+        &worker_name,
+        &worker_id,
+        session_id,
+        peer_label,
+    )
+    .await
+    {
+        Ok(job) => {
+            insert_recent_job(app, job.clone(), Duration::from_secs(app.args.job_ttl_secs));
+            log_net(format!(
+                "miner connected peer={} wallet={} worker={} height={} bits={} share_bits={} job={} work={}",
+                short_peer_label(peer_label),
+                short_wallet(&wallet),
+                worker_tag(&worker_name),
+                job.height,
+                job.bits,
+                job.share_bits,
+                job.job_id,
+                short_id(&job.work_id)
+            ));
+            Ok(json!({
+                "id": worker_id,
+                "status": "OK",
+                "job": job_json(&job)
+            }))
         }
-    }
-    let job = match job_opt {
-        Some(job) => job,
-        None => {
-            unregister_worker(app, &worker_id);
-            let err = last_err.unwrap_or_else(|| anyhow!("work_fetch_failed"));
+        Err(err) => {
             let err_text = err.to_string();
-            let surfaced = if err_text.contains("launch_guard") || err_text.contains("syncing") {
-                anyhow!("syncing")
-            } else {
-                err
-            };
+            if err_text.contains("launch_guard") || err_text.contains("syncing") {
+                log_job(format!(
+                    "worker waiting peer={} wallet={} worker={} reason=syncing",
+                    short_peer_label(peer_label),
+                    short_wallet(&wallet),
+                    worker_tag(&worker_name)
+                ));
+                return Ok(json!({
+                    "id": worker_id,
+                    "status": "OK"
+                }));
+            }
+            unregister_worker(app, &worker_id);
             log_err(format!(
                 "login rejected peer={} wallet={} worker={} reason=work_fetch_failed err={}",
                 short_peer_label(peer_label),
                 short_wallet(&wallet),
                 worker_tag(&worker_name),
-                surfaced
+                err
             ));
-            return Err(surfaced);
+            Err(err)
         }
-    };
-    insert_recent_job(app, job.clone(), Duration::from_secs(app.args.job_ttl_secs));
-    log_net(format!(
-        "miner connected peer={} wallet={} worker={} height={} bits={} share_bits={} job={} work={}",
-        short_peer_label(peer_label),
-        short_wallet(&wallet),
-        worker_tag(&worker_name),
-        job.height,
-        job.bits,
-        job.share_bits,
-        job.job_id,
-        short_id(&job.work_id)
-    ));
-
-    Ok(json!({
-        "id": worker_id,
-        "status": "OK",
-        "job": job_json(&job)
-    }))
+    }
 }
 
 async fn handle_getjob(app: &App, session_id: &str, params: &Value) -> Result<Value> {
@@ -1710,51 +1685,30 @@ async fn handle_getjob(app: &App, session_id: &str, params: &Value) -> Result<Va
             .unwrap_or_else(|| "-".to_string())
     };
 
-    let mut last_err: Option<anyhow::Error> = None;
-    let mut job_opt = None;
-    let retry_attempts = launch_retry_attempts(&app.args);
-    for attempt in 0..retry_attempts {
-        match fetch_work(app, &wallet, &worker_name, worker_id, session_id, &peer_label).await {
-            Ok(job) => {
-                job_opt = Some(job);
-                break;
-            }
-            Err(e) => {
-                let err_text = e.to_string();
-                let retryable = err_text.contains("launch_guard") || err_text.contains("syncing");
-                last_err = Some(e);
-                if !retryable || attempt + 1 >= retry_attempts {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(GETJOB_RETRY_DELAY_MS)).await;
-            }
+    match fetch_work(app, &wallet, &worker_name, worker_id, session_id, &peer_label).await {
+        Ok(job) => {
+            insert_recent_job(app, job.clone(), Duration::from_secs(app.args.job_ttl_secs));
+            log_job(format!(
+                "assigned work peer={} wallet={} worker={} height={} block_bits={} share_bits={} job={} work={}",
+                short_peer_label(&peer_label),
+                short_wallet(&wallet),
+                worker_tag(&worker_name),
+                job.height,
+                job.bits,
+                job.share_bits,
+                job.job_id,
+                short_id(&job.work_id)
+            ));
+            Ok(json!({"status": "OK", "job": job_json(&job)}))
         }
-    }
-    let job = match job_opt {
-        Some(job) => job,
-        None => {
-            let err = last_err.unwrap_or_else(|| anyhow!("work_fetch_failed"));
+        Err(err) => {
             let err_text = err.to_string();
             if err_text.contains("launch_guard") || err_text.contains("syncing") {
-                return Err(anyhow!("syncing"));
+                return Ok(json!({"status": "WAIT"}));
             }
-            return Err(err);
+            Err(err)
         }
-    };
-    insert_recent_job(app, job.clone(), Duration::from_secs(app.args.job_ttl_secs));
-    log_job(format!(
-        "assigned work peer={} wallet={} worker={} height={} block_bits={} share_bits={} job={} work={}",
-        short_peer_label(&peer_label),
-        short_wallet(&wallet),
-        worker_tag(&worker_name),
-        job.height,
-        job.bits,
-        job.share_bits,
-        job.job_id,
-        short_id(&job.work_id)
-    ));
-
-    Ok(json!({"status": "OK", "job": job_json(&job)}))
+    }
 }
 
 async fn handle_submit(
