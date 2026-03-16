@@ -851,7 +851,7 @@ fn canonical_stratum_error(err_text: &str) -> &'static str {
     } else if err_text == "missing_method" {
         "missing_method"
     } else if err_text.starts_with("launch_guard") {
-        "launch_guard"
+        "waiting_for_sync"
     } else if matches!(
         err_text,
         "unknown_job"
@@ -911,7 +911,7 @@ fn canonical_submit_reject_reason(reply: &Value) -> String {
 fn canonical_work_fetch_reject_reason(status: reqwest::StatusCode, body: &str) -> &'static str {
     if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
         if body.contains("launch_guard_not_ready") || body.contains("launch_guard_") {
-            return "launch_guard";
+            return "waiting_for_sync";
         }
         if body.contains("\"syncing\"") || body.contains("syncing") {
             return "syncing";
@@ -2341,7 +2341,7 @@ mod tests {
         assert_eq!(canonical_stratum_error("rate_limited"), "rate_limited");
         assert_eq!(
             canonical_stratum_error("launch_guard_not_ready"),
-            "launch_guard"
+            "waiting_for_sync"
         );
         assert_eq!(canonical_stratum_error("blob_too_short"), "request_failed");
     }
@@ -2373,7 +2373,7 @@ mod tests {
                 reqwest::StatusCode::SERVICE_UNAVAILABLE,
                 r#"{"error":"launch_guard_not_ready","detail":"launch_guard_syncing tip_height=10 best_seen_height=12"}"#
             ),
-            "launch_guard"
+            "waiting_for_sync"
         );
         assert_eq!(
             canonical_work_fetch_reject_reason(
