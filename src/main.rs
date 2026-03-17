@@ -1511,6 +1511,26 @@ async fn refresh_wallet_job(app: &App, wallet: &str) -> Result<WalletJob> {
     Ok(wallet_job)
 }
 
+async fn refresh_wallet_job_after_candidate(
+    app: &App,
+    wallet: &str,
+    previous_work_id: &str,
+    previous_height: u64,
+) -> Result<WalletJob> {
+    let deadline = Instant::now() + Duration::from_millis(900);
+    let mut last_job = refresh_wallet_job(app, wallet).await?;
+    loop {
+        if last_job.height > previous_height || last_job.work_id != previous_work_id {
+            return Ok(last_job);
+        }
+        if Instant::now() >= deadline {
+            return Ok(last_job);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        last_job = refresh_wallet_job(app, wallet).await?;
+    }
+}
+
 async fn assign_work(
     app: &App,
     wallet: &str,
@@ -2123,6 +2143,7 @@ async fn handle_submit(
         )
         .await;
         consume_job(app, session_id, worker_id, job_id);
+        let _ = refresh_wallet_job_after_candidate(app, &job.wallet, &job.work_id, job.height).await;
         fanout_wallet_job_update(app, &job.wallet, &job.worker_id).await;
         return Ok(json!({
             "status": "OK",
@@ -2499,14 +2520,16 @@ async fn fanout_wallet_job_update(
         let Some(push_tx) = push_tx else {
             continue;
         };
-        let wallet_job = match refresh_wallet_job(
-            app,
-            &worker.wallet,
-        )
-        .await
-        {
-            Ok(job) => job,
-            Err(_) => continue,
+        let wallet_job = {
+            let jobs = lock_or_recover(&app.wallet_jobs, "wallet_jobs");
+            jobs.get(&worker.wallet).cloned()
+        };
+        let wallet_job = match wallet_job {
+            Some(job) => job,
+            None => match refresh_wallet_job(app, &worker.wallet).await {
+                Ok(job) => job,
+                Err(_) => continue,
+            },
         };
         let job = issue_wallet_job(
             app,
