@@ -1458,6 +1458,24 @@ fn issue_wallet_job(
     }
 }
 
+fn same_wallet_job_identity(job: &WorkJob, wallet_job: &WalletJob) -> bool {
+    job.work_id == wallet_job.work_id
+        && job.height == wallet_job.height
+        && job.bits == wallet_job.bits
+        && job.share_bits == wallet_job.share_bits
+        && job.blob == wallet_job.blob
+        && job.anchor_hash32 == wallet_job.anchor_hash32
+        && job.target == wallet_job.target
+}
+
+fn current_worker_job(app: &App, session_id: &str, worker_id: &str) -> Option<WorkJob> {
+    let jobs = lock_or_recover(&app.jobs, "jobs");
+    jobs.values()
+        .filter(|job| job.session_id == session_id && job.worker_id == worker_id)
+        .max_by_key(|job| job.created_at)
+        .cloned()
+}
+
 async fn refresh_wallet_job(app: &App, wallet: &str) -> Result<WalletJob> {
     let work = fetch_work(app, wallet).await?;
     let wallet_job = wallet_job_from_work(&work);
@@ -1487,6 +1505,12 @@ async fn assign_work(
             None => refresh_wallet_job(app, wallet).await?,
         }
     };
+    if let Some(job) = current_worker_job(app, session_id, worker_id) {
+        if same_wallet_job_identity(&job, &wallet_job) {
+            mark_worker_job(app, worker_id, wallet, worker_name, peer_label);
+            return Ok(job);
+        }
+    }
     Ok(issue_wallet_job(
         app,
         &wallet_job,
@@ -2839,6 +2863,42 @@ mod tests {
 
         let err = session_job_lookup(&app, "s1", "w1", "job-1").unwrap_err();
         assert_eq!(err.to_string(), "stale_job");
+    }
+
+    #[test]
+    fn assign_work_reuses_existing_worker_job_for_same_wallet_work() {
+        let app = test_app();
+        let now = Instant::now();
+        lock_or_recover(&app.wallet_jobs, "wallet_jobs").insert(
+            "dut1".to_string(),
+            WalletJob {
+                work_id: "work-1".to_string(),
+                blob: "11".repeat(80),
+                height: 42,
+                bits: 14,
+                share_bits: 24,
+                anchor_hash32: "22".repeat(32),
+                target: "33".repeat(32),
+                created_at: now,
+            },
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let first = rt
+            .block_on(assign_work(&app, "dut1", "rig1", "w1", "s1", "peer", false))
+            .expect("first job");
+        insert_recent_job(&app, first.clone(), Duration::from_secs(app.args.job_ttl_secs));
+
+        let second = rt
+            .block_on(assign_work(&app, "dut1", "rig1", "w1", "s1", "peer", false))
+            .expect("second job");
+
+        assert_eq!(first.job_id, second.job_id);
+        assert_eq!(first.work_id, second.work_id);
+        assert_eq!(first.height, second.height);
     }
 
     #[test]
