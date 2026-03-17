@@ -930,6 +930,28 @@ fn canonical_submit_reject_reason(reply: &Value) -> String {
         .unwrap_or_else(|| "daemon_reject".to_string())
 }
 
+fn daemon_submit_reply_rejected(reply: &Value) -> bool {
+    if reply.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        return true;
+    }
+    if let Some(status) = reply.get("status").and_then(|v| v.as_str()) {
+        if status.eq_ignore_ascii_case("rejected")
+            || status.eq_ignore_ascii_case("reject")
+            || status.eq_ignore_ascii_case("stale")
+            || status.eq_ignore_ascii_case("error")
+        {
+            return true;
+        }
+    }
+    if reply.get("error").map(|v| !v.is_null()).unwrap_or(false) {
+        return true;
+    }
+    if reply.get("reject_reason").is_some() || reply.get("reason").is_some() {
+        return true;
+    }
+    false
+}
+
 fn canonical_work_fetch_reject_reason(status: reqwest::StatusCode, body: &str) -> &'static str {
     if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
         if body.contains("\"syncing\"") || body.contains("syncing") {
@@ -1509,6 +1531,16 @@ fn same_wallet_job_identity(job: &WorkJob, wallet_job: &WalletJob) -> bool {
         && job.target == wallet_job.target
 }
 
+fn same_wallet_job_cache_identity(left: &WalletJob, right: &WalletJob) -> bool {
+    left.work_id == right.work_id
+        && left.height == right.height
+        && left.bits == right.bits
+        && left.share_bits == right.share_bits
+        && left.blob == right.blob
+        && left.anchor_hash32 == right.anchor_hash32
+        && left.target == right.target
+}
+
 fn same_worker_partition(job: &WorkJob, nonce_offset: u32, nonce_stride: u32) -> bool {
     job.nonce_offset == nonce_offset && job.nonce_stride == nonce_stride
 }
@@ -1569,10 +1601,19 @@ async fn assign_work(
             Some(job)
                 if job.created_at.elapsed() < Duration::from_secs(app.args.job_refresh_secs) =>
             {
-                match fetch_tip_height(app).await {
-                    Ok(tip_height) if job.height < tip_height => refresh_wallet_job(app, wallet).await?,
-                    Ok(_) => job,
-                    Err(_) => job,
+                match refresh_wallet_job(app, wallet).await {
+                    Ok(fresh_job) => {
+                        if same_wallet_job_cache_identity(&job, &fresh_job) {
+                            job
+                        } else {
+                            fresh_job
+                        }
+                    }
+                    Err(_) => match fetch_tip_height(app).await {
+                        Ok(tip_height) if job.height < tip_height => refresh_wallet_job(app, wallet).await?,
+                        Ok(_) => job,
+                        Err(_) => job,
+                    },
                 }
             }
             Some(_) => refresh_wallet_job(app, wallet).await?,
@@ -1790,7 +1831,8 @@ async fn submit_candidate(
     let parsed: Value =
         serde_json::from_str(&body).unwrap_or_else(|_| json!({"status":"rejected","detail":body}));
     let reject_reason = canonical_submit_reject_reason(&parsed);
-    if status.is_success() {
+    let accepted = status.is_success() && !daemon_submit_reply_rejected(&parsed);
+    if accepted {
         log_cpu(format!(
             "block submit accepted worker={} job={} work={} status={} elapsed_ms={}",
             worker_tag(worker_name),
@@ -1810,7 +1852,7 @@ async fn submit_candidate(
             reject_reason
         ));
     }
-    if !status.is_success() {
+    if !accepted {
         bail!(parsed.to_string());
     }
     Ok(parsed)
@@ -2202,7 +2244,7 @@ async fn handle_submit(
             true,
             true,
             None,
-            block_hash,
+            block_hash.clone(),
             Some(json!({"nonce": nonce, "result": result_hex, "accepted": accepted})),
         )
         .await;
@@ -2212,7 +2254,10 @@ async fn handle_submit(
         return Ok(json!({
             "status": "OK",
             "candidate": true,
-            "accepted": accepted,
+            "height": job.height,
+            "bits": job.bits,
+            "hash_bits": hash_bits,
+            "hash32": block_hash,
         }));
     }
 
