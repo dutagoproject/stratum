@@ -32,22 +32,22 @@ use tokio::{
     author,
     version,
     about = "DUTA stratum bridge for dutad /work + /submit_work",
-    after_help = "Examples:\n  duta-stratumd --bind 127.0.0.1:11001 --daemon http://127.0.0.1:19085\n  duta-stratumd --bind 0.0.0.0:11001 --daemon http://127.0.0.1:19085 --network mainnet\n  duta-stratumd --pool-api-url http://127.0.0.1:8080/share --pool-api-key secret-key"
+    after_help = "Examples:\n  duta-stratumd --bind 127.0.0.1:11001 --daemon http://127.0.0.1:19085\n  duta-stratumd --bind 0.0.0.0:21001 --daemon http://127.0.0.1:19099 --network mainnet\n  duta-stratumd --pool-api-url http://127.0.0.1:8080/share --pool-api-key secret-key"
 )]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1:11001")]
+    #[arg(long, default_value = "127.0.0.1:11001", help = "Stratum listen address, e.g. 0.0.0.0:21001 for public mainnet")]
     bind: String,
 
-    #[arg(long, default_value = "http://127.0.0.1:19085")]
+    #[arg(long, default_value = "http://127.0.0.1:19085", help = "Daemon mining RPC base URL, e.g. http://127.0.0.1:19099")]
     daemon: String,
 
-    #[arg(long, default_value_t = 24)]
+    #[arg(long, default_value_t = 24, help = "Share difficulty in bits for pool shares")]
     share_bits: u64,
 
-    #[arg(long, default_value_t = 15)]
+    #[arg(long, default_value_t = 15, help = "How long wallet work cache may be reused before refresh")]
     job_refresh_secs: u64,
 
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 30, help = "How long an issued worker job remains valid")]
     job_ttl_secs: u64,
 
     #[arg(long)]
@@ -1420,6 +1420,24 @@ async fn fetch_work(
     Ok(job)
 }
 
+async fn fetch_tip_height(app: &App) -> Result<u64> {
+    let url = format!("{}/tip", app.args.daemon.trim_end_matches('/'));
+    let reply = app
+        .http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {}", url))?;
+    if !reply.status().is_success() {
+        bail!("tip_fetch_failed");
+    }
+    let value: Value = reply.json().await.context("decode /tip reply")?;
+    value
+        .get("height")
+        .and_then(|x| x.as_u64())
+        .ok_or_else(|| anyhow!("tip_height_missing"))
+}
+
 fn wallet_job_from_work(job: &WorkJob) -> WalletJob {
     WalletJob {
         work_id: job.work_id.clone(),
@@ -1548,7 +1566,15 @@ async fn assign_work(
             jobs.get(wallet).cloned()
         };
         match cached {
-            Some(job) if job.created_at.elapsed() < Duration::from_secs(app.args.job_refresh_secs) => job,
+            Some(job)
+                if job.created_at.elapsed() < Duration::from_secs(app.args.job_refresh_secs) =>
+            {
+                match fetch_tip_height(app).await {
+                    Ok(tip_height) if job.height < tip_height => refresh_wallet_job(app, wallet).await?,
+                    Ok(_) => job,
+                    Err(_) => job,
+                }
+            }
             Some(_) => refresh_wallet_job(app, wallet).await?,
             None => refresh_wallet_job(app, wallet).await?,
         }
