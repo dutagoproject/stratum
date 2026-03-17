@@ -193,6 +193,7 @@ struct App {
     workers: Arc<Mutex<HashMap<String, WorkerState>>>,
     worker_push: Arc<Mutex<HashMap<String, UnboundedSender<Value>>>>,
     stats: Arc<Mutex<HashMap<String, WorkerStats>>>,
+    candidate_in_flight: Arc<Mutex<HashMap<String, Instant>>>,
     conn_limit: Arc<Semaphore>,
     peer_limits: Arc<Mutex<HashMap<IpAddr, PeerState>>>,
     subnet_limits: Arc<Mutex<HashMap<String, usize>>>,
@@ -275,6 +276,8 @@ const CLIENT_IDLE_TIMEOUT_SECS: u64 = 30;
 const PRELOGIN_IDLE_TIMEOUT_SECS: u64 = 5;
 const OFFICIAL_POOL_BIND: &str = "0.0.0.0:21001";
 const OFFICIAL_POOL_DAEMON: &str = "http://127.0.0.1:19085";
+const CANDIDATE_SUBMIT_TIMEOUT_SECS: u64 = 3;
+const CANDIDATE_IN_FLIGHT_TTL_SECS: u64 = 6;
 const OFFICIAL_POOL_PUBLIC_IP: &str = "213.199.44.138";
 const MAX_CONNECTIONS_PER_IP: usize = 16;
 const MAX_CONNECTIONS_PER_PUBLIC_SUBNET: usize = 32;
@@ -1609,6 +1612,24 @@ fn session_job_lookup(app: &App, session_id: &str, worker_id: &str, job_id: &str
     Ok(job.clone())
 }
 
+fn candidate_submit_enter(app: &App, work_id: &str) -> bool {
+    let now = Instant::now();
+    let mut in_flight = lock_or_recover(&app.candidate_in_flight, "candidate_in_flight");
+    in_flight.retain(|_, started| {
+        now.duration_since(*started) < Duration::from_secs(CANDIDATE_IN_FLIGHT_TTL_SECS)
+    });
+    if in_flight.contains_key(work_id) {
+        return false;
+    }
+    in_flight.insert(work_id.to_string(), now);
+    true
+}
+
+fn candidate_submit_exit(app: &App, work_id: &str) {
+    let mut in_flight = lock_or_recover(&app.candidate_in_flight, "candidate_in_flight");
+    in_flight.remove(work_id);
+}
+
 fn verify_share(job: &WorkJob, nonce: u64, result_hex: &str) -> Result<(bool, u32)> {
     let anchor = parse_h32(&job.anchor_hash32)?;
     let blob_bytes = hex::decode(&job.blob).context("decode blob")?;
@@ -1703,6 +1724,9 @@ async fn submit_candidate(
     work_id: &str,
     nonce: u64,
 ) -> Result<Value> {
+    if !candidate_submit_enter(app, work_id) {
+        bail!("stale_job");
+    }
     log_cpu(format!(
         "block attempt worker={} job={} work={} nonce={}",
         worker_tag(worker_name),
@@ -1712,20 +1736,33 @@ async fn submit_candidate(
     ));
     let url = format!("{}/submit_work", app.args.daemon.trim_end_matches('/'));
     let started = Instant::now();
-    let reply = app
-        .http
-        .post(&url)
-        .header("x-duta-work-source", "official-stratum")
-        .json(&SubmitReq {
-            work_id: work_id.to_string(),
-            nonce,
-        })
-        .send()
-        .await
-        .with_context(|| format!("POST {}", url))?;
+    let reply = tokio::time::timeout(
+        Duration::from_secs(CANDIDATE_SUBMIT_TIMEOUT_SECS),
+        app.http
+            .post(&url)
+            .header("x-duta-work-source", "official-stratum")
+            .json(&SubmitReq {
+                work_id: work_id.to_string(),
+                nonce,
+            })
+            .send(),
+    )
+    .await;
+    let reply = match reply {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(err)) => {
+            candidate_submit_exit(app, work_id);
+            return Err(err).with_context(|| format!("POST {}", url));
+        }
+        Err(_) => {
+            candidate_submit_exit(app, work_id);
+            bail!("submit_timeout");
+        }
+    };
 
     let status = reply.status();
     let body = reply.text().await.unwrap_or_default();
+    candidate_submit_exit(app, work_id);
     let parsed: Value =
         serde_json::from_str(&body).unwrap_or_else(|_| json!({"status":"rejected","detail":body}));
     let reject_reason = canonical_submit_reject_reason(&parsed);
@@ -2418,6 +2455,7 @@ async fn main() -> Result<()> {
         workers: Arc::new(Mutex::new(HashMap::new())),
         worker_push: Arc::new(Mutex::new(HashMap::new())),
         stats: Arc::new(Mutex::new(HashMap::new())),
+        candidate_in_flight: Arc::new(Mutex::new(HashMap::new())),
         conn_limit: Arc::new(Semaphore::new(MAX_STRATUM_CONNECTIONS)),
         peer_limits: Arc::new(Mutex::new(HashMap::new())),
         subnet_limits: Arc::new(Mutex::new(HashMap::new())),
@@ -2576,6 +2614,7 @@ mod tests {
             workers: Arc::new(Mutex::new(HashMap::new())),
             worker_push: Arc::new(Mutex::new(HashMap::new())),
             stats: Arc::new(Mutex::new(HashMap::new())),
+            candidate_in_flight: Arc::new(Mutex::new(HashMap::new())),
             conn_limit: Arc::new(Semaphore::new(MAX_STRATUM_CONNECTIONS)),
             peer_limits: Arc::new(Mutex::new(HashMap::new())),
             subnet_limits: Arc::new(Mutex::new(HashMap::new())),
