@@ -21,7 +21,10 @@ use time::{format_description, OffsetDateTime, UtcOffset};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{
+        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        OwnedSemaphorePermit, Semaphore,
+    },
 };
 
 #[derive(Parser, Debug, Clone)]
@@ -173,6 +176,7 @@ struct App {
     jobs: Arc<Mutex<HashMap<String, WorkJob>>>,
     consumed_jobs: Arc<Mutex<HashMap<String, ConsumedJob>>>,
     workers: Arc<Mutex<HashMap<String, WorkerState>>>,
+    worker_push: Arc<Mutex<HashMap<String, UnboundedSender<Value>>>>,
     stats: Arc<Mutex<HashMap<String, WorkerStats>>>,
     conn_limit: Arc<Semaphore>,
     peer_limits: Arc<Mutex<HashMap<IpAddr, PeerState>>>,
@@ -1116,6 +1120,16 @@ fn worker_lookup(app: &App, session_id: &str, worker_id: &str) -> Result<WorkerS
     Ok(worker.clone())
 }
 
+fn register_worker_push(app: &App, worker_id: &str, tx: UnboundedSender<Value>) {
+    let mut push = lock_or_recover(&app.worker_push, "worker_push");
+    push.insert(worker_id.to_string(), tx);
+}
+
+fn unregister_worker_push(app: &App, worker_id: &str) {
+    let mut push = lock_or_recover(&app.worker_push, "worker_push");
+    push.remove(worker_id);
+}
+
 fn insert_recent_job(app: &App, job: WorkJob, ttl: Duration) {
     let mut jobs = lock_or_recover(&app.jobs, "jobs");
     let _ = prune_jobs(&mut jobs, ttl);
@@ -1960,6 +1974,7 @@ async fn handle_submit(
         )
         .await;
         consume_job(app, session_id, worker_id, job_id);
+        fanout_wallet_job_update(app, &job.wallet, &job.worker_id).await;
         return Ok(json!({
             "status": "OK",
             "candidate": true,
@@ -2057,44 +2072,55 @@ async fn handle_client(
     let session_id = format!("s{:016x}", app.seq.fetch_add(1, Ordering::Relaxed));
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
+    let (push_tx, mut push_rx): (UnboundedSender<Value>, UnboundedReceiver<Value>) = unbounded_channel();
     let mut authenticated = false;
 
     loop {
-        let idle_timeout_secs = if authenticated {
-            CLIENT_IDLE_TIMEOUT_SECS
-        } else {
-            PRELOGIN_IDLE_TIMEOUT_SECS
-        };
-        let read = match tokio::time::timeout(
-            Duration::from_secs(idle_timeout_secs),
-            read_line_limited(&mut reader, MAX_STRATUM_LINE_BYTES),
-        )
-        .await
-        {
-            Ok(Ok(read)) => read,
-            Ok(Err(e)) => {
-                let err_text = e.to_string();
-                if should_ban_for_client_error(&err_text) {
-                    if let Some(ip) = peer.and_then(|p| Some(p.ip())) {
-                        ban_peer_temporarily(&app, ip);
+        let read = {
+            let idle_timeout_secs = if authenticated {
+                CLIENT_IDLE_TIMEOUT_SECS
+            } else {
+                PRELOGIN_IDLE_TIMEOUT_SECS
+            };
+            tokio::select! {
+                maybe_push = push_rx.recv() => {
+                    if let Some(out) = maybe_push {
+                        write_json_line(&mut w, &out).await?;
+                    }
+                    continue;
+                }
+                read = tokio::time::timeout(
+                    Duration::from_secs(idle_timeout_secs),
+                    read_line_limited(&mut reader, MAX_STRATUM_LINE_BYTES),
+                ) => {
+                    match read {
+                        Ok(Ok(read)) => read,
+                        Ok(Err(e)) => {
+                            let err_text = e.to_string();
+                            if should_ban_for_client_error(&err_text) {
+                                if let Some(ip) = peer.and_then(|p| Some(p.ip())) {
+                                    ban_peer_temporarily(&app, ip);
+                                }
+                            }
+                            log_err(format!(
+                                "disconnect peer={} reason={}",
+                                short_peer_label(&peer_label),
+                                err_text
+                            ));
+                            return Err(e);
+                        }
+                        Err(_) => {
+                            if let Some(ip) = peer.and_then(|p| Some(p.ip())) {
+                                ban_peer_temporarily(&app, ip);
+                            }
+                            log_err(format!(
+                                "disconnect peer={} reason=client_idle_timeout",
+                                short_peer_label(&peer_label)
+                            ));
+                            bail!("client_idle_timeout");
+                        }
                     }
                 }
-                log_err(format!(
-                    "disconnect peer={} reason={}",
-                    short_peer_label(&peer_label),
-                    err_text
-                ));
-                return Err(e);
-            }
-            Err(_) => {
-                if let Some(ip) = peer.and_then(|p| Some(p.ip())) {
-                    ban_peer_temporarily(&app, ip);
-                }
-                log_err(format!(
-                    "disconnect peer={} reason=client_idle_timeout",
-                    short_peer_label(&peer_label)
-                ));
-                bail!("client_idle_timeout");
             }
         };
         let Some(line_buf) = read else { break; };
@@ -2156,6 +2182,9 @@ async fn handle_client(
             Ok(result) => {
                 if msg.method.as_deref() == Some("login") {
                     authenticated = true;
+                    if let Some(worker_id) = result.get("id").and_then(|x| x.as_str()) {
+                        register_worker_push(&app, worker_id, push_tx.clone());
+                    }
                 }
                 json!({"id": msg.id, "result": result, "error": Value::Null})
             }
@@ -2213,6 +2242,7 @@ async fn main() -> Result<()> {
         jobs: Arc::new(Mutex::new(HashMap::new())),
         consumed_jobs: Arc::new(Mutex::new(HashMap::new())),
         workers: Arc::new(Mutex::new(HashMap::new())),
+        worker_push: Arc::new(Mutex::new(HashMap::new())),
         stats: Arc::new(Mutex::new(HashMap::new())),
         conn_limit: Arc::new(Semaphore::new(MAX_STRATUM_CONNECTIONS)),
         peer_limits: Arc::new(Mutex::new(HashMap::new())),
@@ -2271,6 +2301,7 @@ async fn main() -> Result<()> {
     }
 }
 fn unregister_worker(app: &App, worker_id: &str) {
+    unregister_worker_push(app, worker_id);
     {
         let mut workers = lock_or_recover(&app.workers, "workers");
         workers.remove(worker_id);
@@ -2286,6 +2317,57 @@ fn unregister_worker(app: &App, worker_id: &str) {
     {
         let mut consumed = lock_or_recover(&app.consumed_jobs, "consumed_jobs");
         consumed.retain(|_, job| job.worker_id != worker_id);
+    }
+}
+
+async fn fanout_wallet_job_update(
+    app: &App,
+    wallet: &str,
+    exclude_worker_id: &str,
+) {
+    let workers: Vec<(String, WorkerState, String)> = {
+        let workers_map = lock_or_recover(&app.workers, "workers");
+        let stats_map = lock_or_recover(&app.stats, "stats");
+        workers_map
+            .iter()
+            .filter(|(worker_id, worker)| worker.wallet == wallet && worker_id.as_str() != exclude_worker_id)
+            .map(|(worker_id, worker)| {
+                let peer_label = stats_map
+                    .get(worker_id)
+                    .map(|s| s.peer_label.clone())
+                    .unwrap_or_else(|| "-".to_string());
+                (worker_id.clone(), worker.clone(), peer_label)
+            })
+            .collect()
+    };
+
+    for (worker_id, worker, peer_label) in workers {
+        let push_tx = {
+            let push = lock_or_recover(&app.worker_push, "worker_push");
+            push.get(&worker_id).cloned()
+        };
+        let Some(push_tx) = push_tx else {
+            continue;
+        };
+        let job = match fetch_work(
+            app,
+            &worker.wallet,
+            &worker.worker_name,
+            &worker_id,
+            &worker.session_id,
+            &peer_label,
+        )
+        .await
+        {
+            Ok(job) => job,
+            Err(_) => continue,
+        };
+        insert_recent_job(app, job.clone(), Duration::from_secs(app.args.job_ttl_secs));
+        let _ = push_tx.send(json!({
+            "id": Value::Null,
+            "method": "job",
+            "params": job_json(&job)
+        }));
     }
 }
 
@@ -2310,6 +2392,7 @@ mod tests {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             consumed_jobs: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
+            worker_push: Arc::new(Mutex::new(HashMap::new())),
             stats: Arc::new(Mutex::new(HashMap::new())),
             conn_limit: Arc::new(Semaphore::new(MAX_STRATUM_CONNECTIONS)),
             peer_limits: Arc::new(Mutex::new(HashMap::new())),
