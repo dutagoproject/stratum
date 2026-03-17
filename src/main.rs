@@ -1752,13 +1752,45 @@ async fn handle_submit(
     let job = match session_job_lookup(app, session_id, worker_id, job_id) {
         Ok(job) => job,
         Err(e) => {
+            let err_text = e.to_string();
+            if is_stale_error_text(&err_text) || is_stale_reject_reason(&err_text) {
+                if let Ok(worker) = worker_lookup(app, session_id, worker_id) {
+                    let peer_label = {
+                        let stats = lock_or_recover(&app.stats, "stats");
+                        stats
+                            .get(worker_id)
+                            .map(|s| s.peer_label.clone())
+                            .unwrap_or_else(|| "-".to_string())
+                    };
+                    if let Ok(job) = fetch_work(
+                        app,
+                        &worker.wallet,
+                        &worker.worker_name,
+                        worker_id,
+                        session_id,
+                        &peer_label,
+                    )
+                    .await
+                    {
+                        insert_recent_job(
+                            app,
+                            job.clone(),
+                            Duration::from_secs(app.args.job_ttl_secs),
+                        );
+                        return Ok(json!({
+                            "status": "STALE",
+                            "job": job_json(&job)
+                        }));
+                    }
+                }
+            }
             log_err(format!(
                 "share rejected worker={} job={} reason={}",
                 worker_tag(worker_id),
                 job_id,
-                e
+                err_text
             ));
-            return Err(e);
+            return Err(anyhow!(err_text));
         }
     };
     if job.worker_id != worker_id {
