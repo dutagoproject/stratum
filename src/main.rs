@@ -1345,7 +1345,9 @@ async fn fetch_work(
     };
     let mut req = app.http.get(&url);
     if trusted_launch_pool_enabled(&app.args) {
-        req = req.header("x-duta-work-source", "official-stratum");
+        req = req
+            .header("x-duta-work-source", "official-stratum")
+            .header("x-duta-worker", worker_name);
     }
     let reply = req
         .send()
