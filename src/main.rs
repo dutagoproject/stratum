@@ -276,8 +276,8 @@ const CLIENT_IDLE_TIMEOUT_SECS: u64 = 30;
 const PRELOGIN_IDLE_TIMEOUT_SECS: u64 = 5;
 const OFFICIAL_POOL_BIND: &str = "0.0.0.0:21001";
 const OFFICIAL_POOL_DAEMON: &str = "http://127.0.0.1:19085";
-const CANDIDATE_SUBMIT_TIMEOUT_SECS: u64 = 3;
-const CANDIDATE_IN_FLIGHT_TTL_SECS: u64 = 6;
+const CANDIDATE_SUBMIT_TIMEOUT_SECS: u64 = 30;
+const CANDIDATE_IN_FLIGHT_TTL_SECS: u64 = 35;
 const OFFICIAL_POOL_PUBLIC_IP: &str = "213.199.44.138";
 const MAX_CONNECTIONS_PER_IP: usize = 16;
 const MAX_CONNECTIONS_PER_PUBLIC_SUBNET: usize = 32;
@@ -654,6 +654,7 @@ fn hashes_for_share_bits(bits: u64) -> f64 {
     2f64.powf(bits.min(63) as f64)
 }
 
+#[allow(dead_code)]
 fn rig_key(peer_label: &str, worker_name: &str) -> String {
     let worker = worker_name.trim();
     if worker.is_empty() {
@@ -853,6 +854,7 @@ fn estimated_wallet_hashrate(app: &App, wallet: &str) -> f64 {
     total
 }
 
+#[allow(dead_code)]
 fn estimated_rig_hashrate(app: &App, peer_label: &str, worker_name: &str) -> f64 {
     let now = Instant::now();
     let mut stats = lock_or_recover(&app.stats, "stats");
@@ -872,8 +874,6 @@ fn canonical_stratum_error(err_text: &str) -> &'static str {
         "unknown_method"
     } else if err_text == "missing_method" {
         "missing_method"
-    } else if err_text.starts_with("launch_guard") {
-        "waiting_for_sync"
     } else if matches!(
         err_text,
         "unknown_job"
@@ -932,9 +932,6 @@ fn canonical_submit_reject_reason(reply: &Value) -> String {
 
 fn canonical_work_fetch_reject_reason(status: reqwest::StatusCode, body: &str) -> &'static str {
     if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-        if body.contains("launch_guard_not_ready") || body.contains("launch_guard_") {
-            return "waiting_for_sync";
-        }
         if body.contains("\"syncing\"") || body.contains("syncing") {
             return "syncing";
         }
@@ -1323,7 +1320,7 @@ async fn verify_daemon_reachable(
     }
     if work_status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
         if trusted_launch_pool
-            && (body.contains("launch_guard_not_ready") || body.contains("launch_guard_"))
+                    && (body.contains("sync_not_ready") || body.contains("sync_gate_"))
         {
             return Ok(());
         }
@@ -1551,7 +1548,8 @@ async fn assign_work(
             jobs.get(wallet).cloned()
         };
         match cached {
-            Some(job) => job,
+            Some(job) if job.created_at.elapsed() < Duration::from_secs(app.args.job_refresh_secs) => job,
+            Some(_) => refresh_wallet_job(app, wallet).await?,
             None => refresh_wallet_job(app, wallet).await?,
         }
     };
@@ -1777,7 +1775,7 @@ async fn submit_candidate(
         ));
     } else if !is_stale_reject_reason(&reject_reason) {
         log_cpu(format!(
-            "block submit rejected worker={} job={} work={} status={} elapsed_ms={} reason={}",
+            "block candidate was not accepted worker={} job={} work={} status={} elapsed_ms={} reason={}",
             worker_tag(worker_name),
             job_id,
             short_id(work_id),
@@ -1807,7 +1805,7 @@ async fn handle_login(
         Ok(v) => v,
         Err(e) => {
             log_err(format!(
-                "login rejected peer={} reason={}",
+                "login could not be accepted peer={} reason={}",
                 short_peer_label(peer_label),
                 e
             ));
@@ -1836,14 +1834,14 @@ async fn handle_login(
         &worker_id,
         session_id,
         peer_label,
-        false,
+        true,
     )
     .await
     {
         Ok(job) => {
             insert_recent_job(app, job.clone(), Duration::from_secs(app.args.job_ttl_secs));
             log_net(format!(
-                "miner connected peer={} wallet={} worker={} height={} bits={} share_bits={} job={} work={}",
+                "miner connected peer={} wallet={} worker={} current_height={} block_bits={} share_bits={} job={} work={}",
                 short_peer_label(peer_label),
                 short_wallet(&wallet),
                 worker_tag(&worker_name),
@@ -1861,9 +1859,9 @@ async fn handle_login(
         }
         Err(err) => {
             let err_text = err.to_string();
-            if err_text.contains("launch_guard") || err_text.contains("syncing") {
+            if err_text.contains("syncing") {
                 log_job(format!(
-                    "worker waiting peer={} wallet={} worker={} reason=syncing",
+                    "worker connected and waiting for the node to finish syncing peer={} wallet={} worker={}",
                     short_peer_label(peer_label),
                     short_wallet(&wallet),
                     worker_tag(&worker_name)
@@ -1875,7 +1873,7 @@ async fn handle_login(
             }
             unregister_worker(app, &worker_id);
             log_err(format!(
-                "login rejected peer={} wallet={} worker={} reason=work_fetch_failed err={}",
+                "login completed but the first job could not be prepared peer={} wallet={} worker={} reason=work_fetch_failed err={}",
                 short_peer_label(peer_label),
                 short_wallet(&wallet),
                 worker_tag(&worker_name),
@@ -1889,7 +1887,7 @@ async fn handle_login(
 async fn handle_getjob(app: &App, session_id: &str, params: &Value) -> Result<Value> {
     let worker_id = params.get("id").and_then(|x| x.as_str()).unwrap_or("");
     if worker_id.is_empty() {
-        log_err("job request rejected reason=missing_worker_id");
+        log_err("job request could not be served reason=missing_worker_id");
         bail!("missing_worker_id");
     }
 
@@ -1897,7 +1895,7 @@ async fn handle_getjob(app: &App, session_id: &str, params: &Value) -> Result<Va
         Ok(worker) => worker,
         Err(e) => {
             log_err(format!(
-                "job request rejected worker={} reason={}",
+                "job request could not be served worker={} reason={}",
                 worker_tag(worker_id),
                 e
             ));
@@ -1928,7 +1926,7 @@ async fn handle_getjob(app: &App, session_id: &str, params: &Value) -> Result<Va
         Ok(job) => {
             insert_recent_job(app, job.clone(), Duration::from_secs(app.args.job_ttl_secs));
             log_job(format!(
-                "assigned work peer={} wallet={} worker={} height={} block_bits={} share_bits={} job={} work={}",
+                "new work assigned peer={} wallet={} worker={} height={} block_bits={} share_bits={} job={} work={}",
                 short_peer_label(&peer_label),
                 short_wallet(&wallet),
                 worker_tag(&worker_name),
@@ -1942,7 +1940,7 @@ async fn handle_getjob(app: &App, session_id: &str, params: &Value) -> Result<Va
         }
         Err(err) => {
             let err_text = err.to_string();
-            if err_text.contains("launch_guard") || err_text.contains("syncing") {
+            if err_text.contains("syncing") {
                 return Ok(json!({"status": "WAIT"}));
             }
             Err(err)
@@ -2677,10 +2675,6 @@ mod tests {
         assert_eq!(canonical_stratum_error("syncing"), "syncing");
         assert_eq!(canonical_stratum_error("busy"), "busy");
         assert_eq!(canonical_stratum_error("rate_limited"), "rate_limited");
-        assert_eq!(
-            canonical_stratum_error("launch_guard_not_ready"),
-            "waiting_for_sync"
-        );
         assert_eq!(canonical_stratum_error("blob_too_short"), "request_failed");
     }
 
@@ -2705,14 +2699,7 @@ mod tests {
     }
 
     #[test]
-    fn work_fetch_reject_reason_prefers_launch_guard_and_syncing() {
-        assert_eq!(
-            canonical_work_fetch_reject_reason(
-                reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                r#"{"error":"launch_guard_not_ready","detail":"launch_guard_syncing tip_height=10 best_seen_height=12"}"#
-            ),
-            "waiting_for_sync"
-        );
+    fn work_fetch_reject_reason_prefers_syncing_and_busy() {
         assert_eq!(
             canonical_work_fetch_reject_reason(
                 reqwest::StatusCode::SERVICE_UNAVAILABLE,
