@@ -88,6 +88,18 @@ struct WorkJob {
 }
 
 #[derive(Debug, Clone)]
+struct WalletJob {
+    work_id: String,
+    blob: String,
+    height: u64,
+    bits: u64,
+    share_bits: u64,
+    anchor_hash32: String,
+    target: String,
+    created_at: Instant,
+}
+
+#[derive(Debug, Clone)]
 struct WorkerState {
     session_id: String,
     wallet: String,
@@ -174,6 +186,7 @@ struct App {
     http: reqwest::Client,
     seq: Arc<AtomicU64>,
     jobs: Arc<Mutex<HashMap<String, WorkJob>>>,
+    wallet_jobs: Arc<Mutex<HashMap<String, WalletJob>>>,
     consumed_jobs: Arc<Mutex<HashMap<String, ConsumedJob>>>,
     workers: Arc<Mutex<HashMap<String, WorkerState>>>,
     worker_push: Arc<Mutex<HashMap<String, UnboundedSender<Value>>>>,
@@ -1335,20 +1348,14 @@ async fn write_json_line(w: &mut tokio::net::tcp::OwnedWriteHalf, v: &Value) -> 
 async fn fetch_work(
     app: &App,
     wallet: &str,
-    worker_name: &str,
-    worker_id: &str,
-    session_id: &str,
-    peer_label: &str,
 ) -> Result<WorkJob> {
     let wallet_hs = estimated_wallet_hashrate(app, wallet);
-    let rig_hs = estimated_rig_hashrate(app, peer_label, worker_name);
-    let effective_hs = wallet_hs.max(rig_hs);
-    let url = if effective_hs > 0.0 {
+    let url = if wallet_hs > 0.0 {
         format!(
             "{}/work?address={}&hs={:.3}",
             app.args.daemon.trim_end_matches('/'),
             wallet,
-            effective_hs
+            wallet_hs
         )
     } else {
         format!(
@@ -1361,7 +1368,7 @@ async fn fetch_work(
     if trusted_launch_pool_enabled(&app.args) {
         req = req
             .header("x-duta-work-source", "official-stratum")
-            .header("x-duta-worker", worker_name);
+            .header("x-duta-worker", wallet);
     }
     let reply = req
         .send()
@@ -1373,10 +1380,8 @@ async fn fetch_work(
         let body = reply.text().await.unwrap_or_default();
         let reason = canonical_work_fetch_reject_reason(status, &body);
         log_err(format!(
-            "work fetch failed wallet={} worker={} peer={} status={} reason={} body={}",
+            "work fetch failed wallet={} status={} reason={} body={}",
             short_wallet(wallet),
-            worker_tag(worker_name),
-            short_peer_label(peer_label),
             status,
             reason,
             body
@@ -1385,14 +1390,11 @@ async fn fetch_work(
     }
 
     let work: WorkReply = reply.json().await.context("decode /work reply")?;
-    let seq = app.seq.fetch_add(1, Ordering::Relaxed);
-    let job_id = format!("{:016x}", seq);
-    mark_worker_job(app, worker_id, wallet, worker_name, peer_label);
     let job = WorkJob {
-        job_id,
-        session_id: session_id.to_string(),
-        worker_name: worker_name.to_string(),
-        worker_id: worker_id.to_string(),
+        job_id: String::new(),
+        session_id: String::new(),
+        worker_name: String::new(),
+        worker_id: String::new(),
         wallet: wallet.to_string(),
         work_id: work.work_id,
         blob: work.header80,
@@ -1404,17 +1406,96 @@ async fn fetch_work(
         created_at: Instant::now(),
     };
     log_net(format!(
-        "new work wallet={} worker={} height={} block_bits={} share_bits={} wallet_hs={} rig_hs={} active_hs={}",
+        "new work wallet={} height={} block_bits={} share_bits={} wallet_hs={}",
         short_wallet(wallet),
-        worker_tag(&job.worker_name),
         job.height,
         job.bits,
         job.share_bits,
         format_hashrate(wallet_hs),
-        format_hashrate(rig_hs),
-        format_hashrate(effective_hs),
     ));
     Ok(job)
+}
+
+fn wallet_job_from_work(job: &WorkJob) -> WalletJob {
+    WalletJob {
+        work_id: job.work_id.clone(),
+        blob: job.blob.clone(),
+        height: job.height,
+        bits: job.bits,
+        share_bits: job.share_bits,
+        anchor_hash32: job.anchor_hash32.clone(),
+        target: job.target.clone(),
+        created_at: job.created_at,
+    }
+}
+
+fn issue_wallet_job(
+    app: &App,
+    wallet_job: &WalletJob,
+    wallet: &str,
+    worker_name: &str,
+    worker_id: &str,
+    session_id: &str,
+    peer_label: &str,
+) -> WorkJob {
+    let seq = app.seq.fetch_add(1, Ordering::Relaxed);
+    let job_id = format!("{:016x}", seq);
+    mark_worker_job(app, worker_id, wallet, worker_name, peer_label);
+    WorkJob {
+        job_id,
+        session_id: session_id.to_string(),
+        worker_name: worker_name.to_string(),
+        worker_id: worker_id.to_string(),
+        wallet: wallet.to_string(),
+        work_id: wallet_job.work_id.clone(),
+        blob: wallet_job.blob.clone(),
+        height: wallet_job.height,
+        bits: wallet_job.bits,
+        share_bits: wallet_job.share_bits,
+        anchor_hash32: wallet_job.anchor_hash32.clone(),
+        target: wallet_job.target.clone(),
+        created_at: wallet_job.created_at,
+    }
+}
+
+async fn refresh_wallet_job(app: &App, wallet: &str) -> Result<WalletJob> {
+    let work = fetch_work(app, wallet).await?;
+    let wallet_job = wallet_job_from_work(&work);
+    let mut jobs = lock_or_recover(&app.wallet_jobs, "wallet_jobs");
+    jobs.insert(wallet.to_string(), wallet_job.clone());
+    Ok(wallet_job)
+}
+
+async fn assign_work(
+    app: &App,
+    wallet: &str,
+    worker_name: &str,
+    worker_id: &str,
+    session_id: &str,
+    peer_label: &str,
+    force_refresh: bool,
+) -> Result<WorkJob> {
+    let wallet_job = if force_refresh {
+        refresh_wallet_job(app, wallet).await?
+    } else {
+        let cached = {
+            let jobs = lock_or_recover(&app.wallet_jobs, "wallet_jobs");
+            jobs.get(wallet).cloned()
+        };
+        match cached {
+            Some(job) => job,
+            None => refresh_wallet_job(app, wallet).await?,
+        }
+    };
+    Ok(issue_wallet_job(
+        app,
+        &wallet_job,
+        wallet,
+        worker_name,
+        worker_id,
+        session_id,
+        peer_label,
+    ))
 }
 
 fn job_json(job: &WorkJob) -> Value {
@@ -1632,13 +1713,14 @@ async fn handle_login(
         &worker_name,
         peer_label,
     );
-    match fetch_work(
+    match assign_work(
         app,
         &wallet,
         &worker_name,
         &worker_id,
         session_id,
         peer_label,
+        false,
     )
     .await
     {
@@ -1716,7 +1798,17 @@ async fn handle_getjob(app: &App, session_id: &str, params: &Value) -> Result<Va
             .unwrap_or_else(|| "-".to_string())
     };
 
-    match fetch_work(app, &wallet, &worker_name, worker_id, session_id, &peer_label).await {
+    match assign_work(
+        app,
+        &wallet,
+        &worker_name,
+        worker_id,
+        session_id,
+        &peer_label,
+        false,
+    )
+    .await
+    {
         Ok(job) => {
             insert_recent_job(app, job.clone(), Duration::from_secs(app.args.job_ttl_secs));
             log_job(format!(
@@ -1776,13 +1868,14 @@ async fn handle_submit(
                             .map(|s| s.peer_label.clone())
                             .unwrap_or_else(|| "-".to_string())
                     };
-                    if let Ok(job) = fetch_work(
+                    if let Ok(job) = assign_work(
                         app,
                         &worker.wallet,
                         &worker.worker_name,
                         worker_id,
                         session_id,
                         &peer_label,
+                        false,
                     )
                     .await
                     {
@@ -2240,6 +2333,7 @@ async fn main() -> Result<()> {
         http,
         seq: Arc::new(AtomicU64::new(1)),
         jobs: Arc::new(Mutex::new(HashMap::new())),
+        wallet_jobs: Arc::new(Mutex::new(HashMap::new())),
         consumed_jobs: Arc::new(Mutex::new(HashMap::new())),
         workers: Arc::new(Mutex::new(HashMap::new())),
         worker_push: Arc::new(Mutex::new(HashMap::new())),
@@ -2349,19 +2443,24 @@ async fn fanout_wallet_job_update(
         let Some(push_tx) = push_tx else {
             continue;
         };
-        let job = match fetch_work(
+        let wallet_job = match refresh_wallet_job(
             app,
             &worker.wallet,
-            &worker.worker_name,
-            &worker_id,
-            &worker.session_id,
-            &peer_label,
         )
         .await
         {
             Ok(job) => job,
             Err(_) => continue,
         };
+        let job = issue_wallet_job(
+            app,
+            &wallet_job,
+            &worker.wallet,
+            &worker.worker_name,
+            &worker_id,
+            &worker.session_id,
+            &peer_label,
+        );
         insert_recent_job(app, job.clone(), Duration::from_secs(app.args.job_ttl_secs));
         let _ = push_tx.send(json!({
             "id": Value::Null,
@@ -2390,6 +2489,7 @@ mod tests {
             http: reqwest::Client::new(),
             seq: Arc::new(AtomicU64::new(1)),
             jobs: Arc::new(Mutex::new(HashMap::new())),
+            wallet_jobs: Arc::new(Mutex::new(HashMap::new())),
             consumed_jobs: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             worker_push: Arc::new(Mutex::new(HashMap::new())),
