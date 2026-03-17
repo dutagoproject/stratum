@@ -1861,7 +1861,7 @@ async fn handle_login(
             let err_text = err.to_string();
             if err_text.contains("syncing") {
                 log_job(format!(
-                    "worker connected and waiting for the node to finish syncing peer={} wallet={} worker={}",
+                    "worker connected and waiting sync peer={} wallet={} worker={}",
                     short_peer_label(peer_label),
                     short_wallet(&wallet),
                     worker_tag(&worker_name)
