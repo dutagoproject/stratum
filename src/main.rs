@@ -1461,7 +1461,7 @@ fn issue_wallet_job(
         target: wallet_job.target.clone(),
         nonce_offset,
         nonce_stride,
-        created_at: wallet_job.created_at,
+        created_at: Instant::now(),
     }
 }
 
@@ -1558,7 +1558,10 @@ async fn assign_work(
             && same_worker_partition(&job, nonce_offset, nonce_stride)
         {
             mark_worker_job(app, worker_id, wallet, worker_name, peer_label);
-            return Ok(job);
+            return Ok(WorkJob {
+                created_at: Instant::now(),
+                ..job
+            });
         }
     }
     Ok(issue_wallet_job(
