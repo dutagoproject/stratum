@@ -84,6 +84,8 @@ struct WorkJob {
     share_bits: u64,
     anchor_hash32: String,
     target: String,
+    nonce_offset: u32,
+    nonce_stride: u32,
     created_at: Instant,
 }
 
@@ -1403,6 +1405,8 @@ async fn fetch_work(
         share_bits: app.args.share_bits,
         anchor_hash32: work.anchor_hash32,
         target: job_target_hex(app.args.share_bits),
+        nonce_offset: 0,
+        nonce_stride: 1,
         created_at: Instant::now(),
     };
     log_net(format!(
@@ -1440,6 +1444,7 @@ fn issue_wallet_job(
 ) -> WorkJob {
     let seq = app.seq.fetch_add(1, Ordering::Relaxed);
     let job_id = format!("{:016x}", seq);
+    let (nonce_offset, nonce_stride) = wallet_worker_partition(app, wallet, worker_id);
     mark_worker_job(app, worker_id, wallet, worker_name, peer_label);
     WorkJob {
         job_id,
@@ -1454,8 +1459,26 @@ fn issue_wallet_job(
         share_bits: wallet_job.share_bits,
         anchor_hash32: wallet_job.anchor_hash32.clone(),
         target: wallet_job.target.clone(),
+        nonce_offset,
+        nonce_stride,
         created_at: wallet_job.created_at,
     }
+}
+
+fn wallet_worker_partition(app: &App, wallet: &str, worker_id: &str) -> (u32, u32) {
+    let workers = lock_or_recover(&app.workers, "workers");
+    let mut wallet_workers: Vec<&str> = workers
+        .iter()
+        .filter_map(|(id, state)| (state.wallet == wallet).then_some(id.as_str()))
+        .collect();
+    wallet_workers.sort_unstable();
+    let worker_slots = wallet_workers.len().max(1) as u32;
+    let worker_slot = wallet_workers
+        .iter()
+        .position(|id| *id == worker_id)
+        .map(|idx| idx as u32)
+        .unwrap_or(0);
+    (worker_slot, worker_slots)
 }
 
 fn same_wallet_job_identity(job: &WorkJob, wallet_job: &WalletJob) -> bool {
@@ -1466,6 +1489,10 @@ fn same_wallet_job_identity(job: &WorkJob, wallet_job: &WalletJob) -> bool {
         && job.blob == wallet_job.blob
         && job.anchor_hash32 == wallet_job.anchor_hash32
         && job.target == wallet_job.target
+}
+
+fn same_worker_partition(job: &WorkJob, nonce_offset: u32, nonce_stride: u32) -> bool {
+    job.nonce_offset == nonce_offset && job.nonce_stride == nonce_stride
 }
 
 fn current_worker_job(app: &App, session_id: &str, worker_id: &str) -> Option<WorkJob> {
@@ -1505,8 +1532,11 @@ async fn assign_work(
             None => refresh_wallet_job(app, wallet).await?,
         }
     };
+    let (nonce_offset, nonce_stride) = wallet_worker_partition(app, wallet, worker_id);
     if let Some(job) = current_worker_job(app, session_id, worker_id) {
-        if same_wallet_job_identity(&job, &wallet_job) {
+        if same_wallet_job_identity(&job, &wallet_job)
+            && same_worker_partition(&job, nonce_offset, nonce_stride)
+        {
             mark_worker_job(app, worker_id, wallet, worker_name, peer_label);
             return Ok(job);
         }
@@ -1531,6 +1561,8 @@ fn job_json(job: &WorkJob) -> Value {
         "anchor_hash32": job.anchor_hash32,
         "bits": job.bits,
         "share_bits": job.share_bits,
+        "nonce_offset": job.nonce_offset,
+        "nonce_stride": job.nonce_stride,
     })
 }
 
@@ -2834,6 +2866,8 @@ mod tests {
             share_bits: 24,
             anchor_hash32: "00".repeat(32),
             target: "ff".repeat(32),
+            nonce_offset: 0,
+            nonce_stride: 1,
             created_at: Instant::now(),
         };
         let mut newer_job = base_job.clone();
@@ -2902,6 +2936,39 @@ mod tests {
     }
 
     #[test]
+    fn wallet_worker_partition_assigns_unique_slots_per_wallet() {
+        let app = test_app();
+        lock_or_recover(&app.workers, "workers").insert(
+            "w-b".to_string(),
+            WorkerState {
+                session_id: "s2".to_string(),
+                wallet: "dut1".to_string(),
+                worker_name: "b".to_string(),
+            },
+        );
+        lock_or_recover(&app.workers, "workers").insert(
+            "w-a".to_string(),
+            WorkerState {
+                session_id: "s1".to_string(),
+                wallet: "dut1".to_string(),
+                worker_name: "a".to_string(),
+            },
+        );
+        lock_or_recover(&app.workers, "workers").insert(
+            "w-x".to_string(),
+            WorkerState {
+                session_id: "s3".to_string(),
+                wallet: "dut2".to_string(),
+                worker_name: "x".to_string(),
+            },
+        );
+
+        assert_eq!(wallet_worker_partition(&app, "dut1", "w-a"), (0, 2));
+        assert_eq!(wallet_worker_partition(&app, "dut1", "w-b"), (1, 2));
+        assert_eq!(wallet_worker_partition(&app, "dut2", "w-x"), (0, 1));
+    }
+
+    #[test]
     fn unregister_session_clears_worker_stats_jobs_and_consumed_state() {
         let app = test_app();
         let now = Instant::now();
@@ -2946,6 +3013,8 @@ mod tests {
                 share_bits: 24,
                 anchor_hash32: "00".repeat(32),
                 target: "ff".repeat(32),
+                nonce_offset: 0,
+                nonce_stride: 1,
                 created_at: now,
             },
         );
