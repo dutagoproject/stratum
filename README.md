@@ -39,3 +39,4 @@ This repo is for operators who want to run a public DUTA stratum endpoint or con
 - Linux build: [docs/BUILD_LINUX.md](./docs/BUILD_LINUX.md)
 - Windows build: [docs/BUILD_WINDOWS.md](./docs/BUILD_WINDOWS.md)
 - Deployment guide: [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md)
+- Install from binary: [docs/INSTALL_FROM_BINARY.md](./docs/INSTALL_FROM_BINARY.md)
