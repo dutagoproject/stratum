@@ -197,6 +197,14 @@ struct App {
     conn_limit: Arc<Semaphore>,
     peer_limits: Arc<Mutex<HashMap<IpAddr, PeerState>>>,
     subnet_limits: Arc<Mutex<HashMap<String, usize>>>,
+    operator_counters: Arc<Mutex<OperatorCounters>>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct OperatorCounters {
+    total_connections: u64,
+    temporary_bans: u64,
+    reject_reasons: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +376,8 @@ fn ban_peer_temporarily(app: &App, ip: IpAddr) {
     let state = peer_limits.entry(ip).or_insert_with(|| PeerState::new(now));
     state.last_seen_at = now;
     apply_temporary_peer_ban(state, now);
+    let mut counters = lock_or_recover(&app.operator_counters, "operator_counters");
+    counters.temporary_bans = counters.temporary_bans.saturating_add(1);
 }
 
 fn try_open_peer_connection(app: &App, ip: IpAddr) -> Result<PeerConnectionGuard> {
@@ -838,7 +848,48 @@ fn record_share_result(
     if let Some(bits) = hash_bits {
         entry.best_hash_bits = entry.best_hash_bits.max(bits);
     }
-    entry.last_error = error;
+    entry.last_error = error.clone();
+    if !accepted {
+        if let Some(reason) = error.filter(|reason| !reason.trim().is_empty()) {
+            let mut counters = lock_or_recover(&app.operator_counters, "operator_counters");
+            let entry = counters.reject_reasons.entry(reason).or_insert(0);
+            *entry = entry.saturating_add(1);
+        }
+    }
+}
+
+fn top_reject_reasons_text(reasons: &HashMap<String, u64>, limit: usize) -> String {
+    let mut items: Vec<(String, u64)> = reasons.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    items.truncate(limit);
+    if items.is_empty() {
+        "-".to_string()
+    } else {
+        items
+            .into_iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn operator_global_summary_line(
+    active_sessions: usize,
+    active_workers: usize,
+    accepted_shares: u64,
+    rejected_shares: u64,
+    counters: &OperatorCounters,
+) -> String {
+    format!(
+        "ops_global sessions={} workers={} shares_ok={} shares_bad={} total_connections={} temporary_bans={} reject_reasons={}",
+        active_sessions,
+        active_workers,
+        accepted_shares,
+        rejected_shares,
+        counters.total_connections,
+        counters.temporary_bans,
+        top_reject_reasons_text(&counters.reject_reasons, 5)
+    )
 }
 
 fn estimated_wallet_hashrate(app: &App, wallet: &str) -> f64 {
@@ -997,6 +1048,11 @@ fn is_stale_reject_reason(reason: &str) -> bool {
     )
 }
 
+fn should_defer_first_job(err_text: &str) -> bool {
+    let reason = canonical_stratum_error(err_text);
+    matches!(reason, "syncing" | "busy" | "rate_limited")
+}
+
 fn unregister_session(app: &App, session_id: &str) -> usize {
     let mut removed = 0usize;
     let mut removed_workers: Vec<String> = Vec::new();
@@ -1047,6 +1103,14 @@ fn log_operator_snapshot(app: &App) {
     let now = Instant::now();
     let mut stats = lock_or_recover(&app.stats, "stats");
     let mut wallets: HashMap<String, WalletSnapshot> = HashMap::new();
+    let active_workers = stats.len();
+    let mut total_accepted = 0u64;
+    let mut total_rejected = 0u64;
+    let active_sessions = stats
+        .values()
+        .map(|stat| stat.session_id.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
 
     for stat in stats.values_mut() {
         prune_share_samples(&mut stat.share_samples, now);
@@ -1072,6 +1136,8 @@ fn log_operator_snapshot(app: &App) {
         }
         entry.accepted = entry.accepted.saturating_add(stat.accepted_shares);
         entry.rejected = entry.rejected.saturating_add(stat.rejected_shares);
+        total_accepted = total_accepted.saturating_add(stat.accepted_shares);
+        total_rejected = total_rejected.saturating_add(stat.rejected_shares);
         entry.blocks = entry.blocks.saturating_add(stat.candidate_blocks);
         entry.best_hash_bits = entry.best_hash_bits.max(stat.best_hash_bits);
         if stat
@@ -1094,6 +1160,15 @@ fn log_operator_snapshot(app: &App) {
             .then_with(|| b.connected.cmp(&a.connected))
             .then_with(|| b.accepted.cmp(&a.accepted))
     });
+
+    let counters = lock_or_recover(&app.operator_counters, "operator_counters").clone();
+    log_sys(operator_global_summary_line(
+        active_sessions,
+        active_workers,
+        total_accepted,
+        total_rejected,
+        &counters,
+    ));
 
     for snapshot in snapshots.into_iter().take(8) {
         log_sys(format!(
@@ -1927,12 +2002,13 @@ async fn handle_login(
         }
         Err(err) => {
             let err_text = err.to_string();
-            if err_text.contains("syncing") {
+            if should_defer_first_job(&err_text) {
                 log_job(format!(
-                    "worker connected and waiting sync peer={} wallet={} worker={}",
+                    "worker connected and waiting first job peer={} wallet={} worker={} reason={}",
                     short_peer_label(peer_label),
                     short_wallet(&wallet),
-                    worker_tag(&worker_name)
+                    worker_tag(&worker_name),
+                    canonical_stratum_error(&err_text)
                 ));
                 return Ok(json!({
                     "id": worker_id,
@@ -2528,6 +2604,7 @@ async fn main() -> Result<()> {
         conn_limit: Arc::new(Semaphore::new(MAX_STRATUM_CONNECTIONS)),
         peer_limits: Arc::new(Mutex::new(HashMap::new())),
         subnet_limits: Arc::new(Mutex::new(HashMap::new())),
+        operator_counters: Arc::new(Mutex::new(OperatorCounters::default())),
     };
 
     let mut operator_tick = tokio::time::interval(Duration::from_secs(OPERATOR_SNAPSHOT_SECS));
@@ -2567,6 +2644,11 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
+                {
+                    let mut counters =
+                        lock_or_recover(&app.operator_counters, "operator_counters");
+                    counters.total_connections = counters.total_connections.saturating_add(1);
+                }
                 log_net(format!("connect peer={}", peer));
                 let app_cloned = app.clone();
                 tokio::spawn(async move {
@@ -2687,6 +2769,7 @@ mod tests {
             conn_limit: Arc::new(Semaphore::new(MAX_STRATUM_CONNECTIONS)),
             peer_limits: Arc::new(Mutex::new(HashMap::new())),
             subnet_limits: Arc::new(Mutex::new(HashMap::new())),
+            operator_counters: Arc::new(Mutex::new(OperatorCounters::default())),
         }
     }
 
@@ -2770,6 +2853,40 @@ mod tests {
     }
 
     #[test]
+    fn top_reject_reasons_text_orders_by_count_then_name() {
+        let mut reasons = HashMap::new();
+        reasons.insert("timeout".to_string(), 2);
+        reasons.insert("low_difficulty".to_string(), 5);
+        reasons.insert("stale_job".to_string(), 5);
+        let line = top_reject_reasons_text(&reasons, 3);
+        assert_eq!(line, "low_difficulty=5, stale_job=5, timeout=2");
+    }
+
+    #[test]
+    fn operator_global_summary_line_includes_share_totals_and_counters() {
+        let mut reject_reasons = HashMap::new();
+        reject_reasons.insert("stale_job".to_string(), 4);
+        let line = operator_global_summary_line(
+            2,
+            3,
+            11,
+            5,
+            &OperatorCounters {
+                total_connections: 7,
+                temporary_bans: 1,
+                reject_reasons,
+            },
+        );
+        assert!(line.contains("sessions=2"));
+        assert!(line.contains("workers=3"));
+        assert!(line.contains("shares_ok=11"));
+        assert!(line.contains("shares_bad=5"));
+        assert!(line.contains("total_connections=7"));
+        assert!(line.contains("temporary_bans=1"));
+        assert!(line.contains("reject_reasons=stale_job=4"));
+    }
+
+    #[test]
     fn work_fetch_reject_reason_prefers_syncing_and_busy() {
         assert_eq!(
             canonical_work_fetch_reject_reason(
@@ -2804,6 +2921,15 @@ mod tests {
     #[test]
     fn canonical_error_maps_session_worker_to_stale_job() {
         assert_eq!(canonical_stratum_error("wrong_session_worker"), "stale_job");
+    }
+
+    #[test]
+    fn first_job_defer_treats_transient_backend_conditions_as_nonfatal() {
+        assert!(should_defer_first_job("syncing"));
+        assert!(should_defer_first_job("busy"));
+        assert!(should_defer_first_job("rate_limited"));
+        assert!(!should_defer_first_job("work_fetch_failed"));
+        assert!(!should_defer_first_job("invalid_address"));
     }
 
     #[test]
