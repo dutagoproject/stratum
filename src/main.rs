@@ -44,7 +44,7 @@ struct Args {
     #[arg(long, default_value_t = 24, help = "Share difficulty in bits for pool shares")]
     share_bits: u64,
 
-    #[arg(long, default_value_t = 15, help = "How long wallet work cache may be reused before refresh")]
+    #[arg(long, default_value_t = 2, help = "How long wallet work cache may be reused before refresh")]
     job_refresh_secs: u64,
 
     #[arg(long, default_value_t = 30, help = "How long an issued worker job remains valid")]
@@ -1628,6 +1628,12 @@ fn current_worker_job(app: &App, session_id: &str, worker_id: &str) -> Option<Wo
         .cloned()
 }
 
+fn should_push_refreshed_job(current: Option<&WorkJob>, refreshed: &WorkJob) -> bool {
+    current
+        .map(|job| job.job_id != refreshed.job_id)
+        .unwrap_or(true)
+}
+
 async fn refresh_wallet_job(app: &App, wallet: &str) -> Result<WalletJob> {
     let work = fetch_work(app, wallet).await?;
     let wallet_job = wallet_job_from_work(&work);
@@ -2429,6 +2435,9 @@ async fn handle_client(
     let mut reader = BufReader::new(r);
     let (push_tx, mut push_rx): (UnboundedSender<Value>, UnboundedReceiver<Value>) = unbounded_channel();
     let mut authenticated = false;
+    let mut active_worker_id: Option<String> = None;
+    let mut proactive_refresh_tick =
+        tokio::time::interval(Duration::from_secs(app.args.job_refresh_secs.max(1)));
 
     loop {
         let read = {
@@ -2442,6 +2451,38 @@ async fn handle_client(
                     if let Some(out) = maybe_push {
                         write_json_line(&mut w, &out).await?;
                     }
+                    continue;
+                }
+                _ = proactive_refresh_tick.tick(), if authenticated && active_worker_id.is_some() => {
+                    let Some(worker_id) = active_worker_id.clone() else {
+                        continue;
+                    };
+                    let worker = match worker_lookup(&app, &session_id, &worker_id) {
+                        Ok(worker) => worker,
+                        Err(_) => continue,
+                    };
+                    let current = current_worker_job(&app, &session_id, &worker_id);
+                    let refreshed = match assign_work(
+                        &app,
+                        &worker.wallet,
+                        &worker.worker_name,
+                        &worker_id,
+                        &session_id,
+                        &peer_label,
+                        true,
+                    ).await {
+                        Ok(job) => job,
+                        Err(_) => continue,
+                    };
+                    if !should_push_refreshed_job(current.as_ref(), &refreshed) {
+                        continue;
+                    }
+                    insert_recent_job(&app, refreshed.clone(), Duration::from_secs(app.args.job_ttl_secs));
+                    write_json_line(&mut w, &json!({
+                        "id": Value::Null,
+                        "method": "job",
+                        "params": job_json(&refreshed)
+                    })).await?;
                     continue;
                 }
                 read = tokio::time::timeout(
@@ -2538,6 +2579,7 @@ async fn handle_client(
                 if msg.method.as_deref() == Some("login") {
                     authenticated = true;
                     if let Some(worker_id) = result.get("id").and_then(|x| x.as_str()) {
+                        active_worker_id = Some(worker_id.to_string());
                         register_worker_push(&app, worker_id, push_tx.clone());
                     }
                 }
@@ -2751,7 +2793,7 @@ mod tests {
                 bind: "127.0.0.1:11001".to_string(),
                 daemon: "http://127.0.0.1:19085".to_string(),
                 share_bits: 24,
-                job_refresh_secs: 15,
+                job_refresh_secs: 2,
                 job_ttl_secs: 30,
                 pool_api_url: None,
                 pool_api_key: None,
@@ -2942,8 +2984,8 @@ mod tests {
         );
 
         args.share_bits = 24;
-        args.job_refresh_secs = 15;
-        args.job_ttl_secs = 10;
+        args.job_refresh_secs = 2;
+        args.job_ttl_secs = 1;
         assert_eq!(
             validate_runtime_config(&args).unwrap_err().to_string(),
             "invalid_job_ttl_secs"
@@ -3150,7 +3192,8 @@ mod tests {
 
     #[test]
     fn assign_work_reuses_existing_worker_job_for_same_wallet_work() {
-        let app = test_app();
+        let mut app = test_app();
+        app.args.job_refresh_secs = 60;
         let now = Instant::now();
         lock_or_recover(&app.wallet_jobs, "wallet_jobs").insert(
             "dut1".to_string(),
@@ -3182,6 +3225,40 @@ mod tests {
         assert_eq!(first.job_id, second.job_id);
         assert_eq!(first.work_id, second.work_id);
         assert_eq!(first.height, second.height);
+    }
+
+    #[test]
+    fn refreshed_job_pushes_only_when_job_id_changes() {
+        let current = WorkJob {
+            job_id: "job-1".to_string(),
+            session_id: "s1".to_string(),
+            worker_name: "rig1".to_string(),
+            worker_id: "w1".to_string(),
+            wallet: "dut1".to_string(),
+            work_id: "work-1".to_string(),
+            blob: "00".repeat(80),
+            height: 10,
+            bits: 24,
+            share_bits: 24,
+            anchor_hash32: "11".repeat(32),
+            target: "ff".repeat(4),
+            nonce_offset: 0,
+            nonce_stride: 1,
+            created_at: Instant::now(),
+        };
+        let same = WorkJob {
+            created_at: Instant::now(),
+            ..current.clone()
+        };
+        let newer = WorkJob {
+            job_id: "job-2".to_string(),
+            work_id: "work-2".to_string(),
+            created_at: Instant::now(),
+            ..current.clone()
+        };
+        assert!(!should_push_refreshed_job(Some(&current), &same));
+        assert!(should_push_refreshed_job(Some(&current), &newer));
+        assert!(should_push_refreshed_job(None, &newer));
     }
 
     #[test]
