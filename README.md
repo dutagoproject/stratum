@@ -4,7 +4,12 @@
 
 It sits between miners and the daemon mining API, handles worker sessions, distributes jobs, validates shares, and submits block candidates upstream.
 
-Current release line: `1.0.0`
+Current release line: `1.0.2`
+
+Release `1.0.2` focus:
+
+- stale worker job windows are reduced so miners move to fresh upstream work faster
+- active workers receive refreshed jobs proactively instead of waiting on slow cache reuse alone
 
 Website: https://dutago.xyz
 
