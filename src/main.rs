@@ -80,6 +80,7 @@ struct WorkJob {
     work_id: String,
     blob: String,
     height: u64,
+    pow_version: u8,
     bits: u64,
     share_bits: u64,
     anchor_hash32: String,
@@ -94,6 +95,7 @@ struct WalletJob {
     work_id: String,
     blob: String,
     height: u64,
+    pow_version: u8,
     bits: u64,
     share_bits: u64,
     anchor_hash32: String,
@@ -142,6 +144,8 @@ struct ConsumedJob {
 struct WorkReply {
     work_id: String,
     height: u64,
+    #[serde(default = "default_pow_version")]
+    pow_version: u8,
     bits: u64,
     anchor_hash32: String,
     header80: String,
@@ -151,6 +155,10 @@ struct WorkReply {
 struct SubmitReq {
     work_id: String,
     nonce: u64,
+}
+
+fn default_pow_version() -> u8 {
+    dutahash::POW_VERSION_V3
 }
 
 #[derive(Debug, Serialize)]
@@ -605,10 +613,10 @@ fn parse_h32(hex64: &str) -> Result<H32> {
     Ok(H32(out))
 }
 
-fn dataset_for(height: u64, anchor: H32) -> Arc<Vec<u8>> {
-    let epoch = dutahash::epoch_number(height);
-    let mem_mb = dutahash::stage_mem_mb(height);
-    let key = format!("{}:{}:{}", epoch, mem_mb, hex::encode(anchor.0));
+fn dataset_for(pow_version: u8, height: u64, anchor: H32) -> Arc<Vec<u8>> {
+    let epoch = dutahash::epoch_number_for_version(pow_version, height);
+    let mem_mb = dutahash::stage_mem_mb_for_version(pow_version, height);
+    let key = format!("{}:{}:{}:{}", pow_version, epoch, mem_mb, hex::encode(anchor.0));
 
     if let Some(ds) = lock_or_recover(&DATASET_CACHE, "dataset_cache").get(&key) {
         return Arc::clone(ds);
@@ -621,7 +629,12 @@ fn dataset_for(height: u64, anchor: H32) -> Arc<Vec<u8>> {
         mem_mb,
         hex::encode(anchor.0)
     ));
-    let ds = Arc::new(dutahash::build_dataset_for_epoch(epoch, anchor, mem_mb));
+    let ds = Arc::new(dutahash::build_dataset_for_version(
+        pow_version,
+        epoch,
+        anchor,
+        mem_mb,
+    ));
     lock_or_recover(&DATASET_CACHE, "dataset_cache").insert(key, Arc::clone(&ds));
     ds
 }
@@ -1498,6 +1511,7 @@ async fn fetch_work(
         work_id: work.work_id,
         blob: work.header80,
         height: work.height,
+        pow_version: work.pow_version,
         bits: work.bits,
         share_bits: app.args.share_bits,
         anchor_hash32: work.anchor_hash32,
@@ -1540,6 +1554,7 @@ fn wallet_job_from_work(job: &WorkJob) -> WalletJob {
         work_id: job.work_id.clone(),
         blob: job.blob.clone(),
         height: job.height,
+        pow_version: job.pow_version,
         bits: job.bits,
         share_bits: job.share_bits,
         anchor_hash32: job.anchor_hash32.clone(),
@@ -1570,6 +1585,7 @@ fn issue_wallet_job(
         work_id: wallet_job.work_id.clone(),
         blob: wallet_job.blob.clone(),
         height: wallet_job.height,
+        pow_version: wallet_job.pow_version,
         bits: wallet_job.bits,
         share_bits: wallet_job.share_bits,
         anchor_hash32: wallet_job.anchor_hash32.clone(),
@@ -1597,8 +1613,8 @@ fn wallet_worker_partition(app: &App, wallet: &str, worker_id: &str) -> (u32, u3
 }
 
 fn same_wallet_job_identity(job: &WorkJob, wallet_job: &WalletJob) -> bool {
-    job.work_id == wallet_job.work_id
-        && job.height == wallet_job.height
+    job.height == wallet_job.height
+        && job.pow_version == wallet_job.pow_version
         && job.bits == wallet_job.bits
         && job.share_bits == wallet_job.share_bits
         && job.blob == wallet_job.blob
@@ -1607,8 +1623,8 @@ fn same_wallet_job_identity(job: &WorkJob, wallet_job: &WalletJob) -> bool {
 }
 
 fn same_wallet_job_cache_identity(left: &WalletJob, right: &WalletJob) -> bool {
-    left.work_id == right.work_id
-        && left.height == right.height
+    left.height == right.height
+        && left.pow_version == right.pow_version
         && left.bits == right.bits
         && left.share_bits == right.share_bits
         && left.blob == right.blob
@@ -1682,20 +1698,7 @@ async fn assign_work(
             Some(job)
                 if job.created_at.elapsed() < Duration::from_secs(app.args.job_refresh_secs) =>
             {
-                match refresh_wallet_job(app, wallet).await {
-                    Ok(fresh_job) => {
-                        if same_wallet_job_cache_identity(&job, &fresh_job) {
-                            job
-                        } else {
-                            fresh_job
-                        }
-                    }
-                    Err(_) => match fetch_tip_height(app).await {
-                        Ok(tip_height) if job.height < tip_height => refresh_wallet_job(app, wallet).await?,
-                        Ok(_) => job,
-                        Err(_) => job,
-                    },
-                }
+                job
             }
             Some(_) => refresh_wallet_job(app, wallet).await?,
             None => refresh_wallet_job(app, wallet).await?,
@@ -1730,6 +1733,7 @@ fn job_json(job: &WorkJob) -> Value {
         "blob": job.blob,
         "target": job.target,
         "height": job.height,
+        "pow_version": job.pow_version,
         "anchor_hash32": job.anchor_hash32,
         "bits": job.bits,
         "share_bits": job.share_bits,
@@ -1785,8 +1789,15 @@ fn verify_share(job: &WorkJob, nonce: u64, result_hex: &str) -> Result<(bool, u3
     let mut header80 = [0u8; 80];
     header80.copy_from_slice(&blob_bytes[..80]);
 
-    let dataset = dataset_for(job.height, anchor);
-    let digest = dutahash::pow_digest(&header80, nonce, job.height, anchor, dataset.as_slice());
+    let dataset = dataset_for(job.pow_version, job.height, anchor);
+    let digest = dutahash::pow_digest_for_version(
+        job.pow_version,
+        &header80,
+        nonce,
+        job.height,
+        anchor,
+        dataset.as_slice(),
+    );
     let digest_hex = hex::encode(digest.0);
     if !digest_hex.eq_ignore_ascii_case(result_hex) {
         bail!("bad_result");
@@ -2469,7 +2480,7 @@ async fn handle_client(
                         &worker_id,
                         &session_id,
                         &peer_label,
-                        true,
+                        false,
                     ).await {
                         Ok(job) => job,
                         Err(_) => continue,
@@ -3153,6 +3164,7 @@ mod tests {
             work_id: "work-1".to_string(),
             blob: "00".repeat(80),
             height: 10,
+            pow_version: dutahash::POW_VERSION_V4,
             bits: 24,
             share_bits: 24,
             anchor_hash32: "00".repeat(32),
@@ -3201,6 +3213,7 @@ mod tests {
                 work_id: "work-1".to_string(),
                 blob: "11".repeat(80),
                 height: 42,
+                pow_version: dutahash::POW_VERSION_V4,
                 bits: 14,
                 share_bits: 24,
                 anchor_hash32: "22".repeat(32),
@@ -3238,6 +3251,7 @@ mod tests {
             work_id: "work-1".to_string(),
             blob: "00".repeat(80),
             height: 10,
+            pow_version: dutahash::POW_VERSION_V4,
             bits: 24,
             share_bits: 24,
             anchor_hash32: "11".repeat(32),
@@ -3335,6 +3349,7 @@ mod tests {
                 work_id: "work-1".to_string(),
                 blob: "00".repeat(80),
                 height: 10,
+                pow_version: dutahash::POW_VERSION_V4,
                 bits: 24,
                 share_bits: 24,
                 anchor_hash32: "00".repeat(32),
