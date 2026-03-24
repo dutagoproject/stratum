@@ -27,10 +27,12 @@ use tokio::{
     },
 };
 
+const RELEASE_VERSION: &str = "1.0.2-v4.1-rc1";
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     author,
-    version,
+    version = RELEASE_VERSION,
     about = "DUTA stratum bridge for dutad /work + /submit_work",
     after_help = "Examples:\n  duta-stratumd --bind 127.0.0.1:11001 --daemon http://127.0.0.1:19085\n  duta-stratumd --bind 0.0.0.0:21001 --daemon http://127.0.0.1:19099 --network mainnet\n  duta-stratumd --pool-api-url http://127.0.0.1:8080/share --pool-api-key secret-key"
 )]
