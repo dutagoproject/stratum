@@ -1531,24 +1531,6 @@ async fn fetch_work(
     Ok(job)
 }
 
-async fn fetch_tip_height(app: &App) -> Result<u64> {
-    let url = format!("{}/tip", app.args.daemon.trim_end_matches('/'));
-    let reply = app
-        .http
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {}", url))?;
-    if !reply.status().is_success() {
-        bail!("tip_fetch_failed");
-    }
-    let value: Value = reply.json().await.context("decode /tip reply")?;
-    value
-        .get("height")
-        .and_then(|x| x.as_u64())
-        .ok_or_else(|| anyhow!("tip_height_missing"))
-}
-
 fn wallet_job_from_work(job: &WorkJob) -> WalletJob {
     WalletJob {
         work_id: job.work_id.clone(),
@@ -1620,16 +1602,6 @@ fn same_wallet_job_identity(job: &WorkJob, wallet_job: &WalletJob) -> bool {
         && job.blob == wallet_job.blob
         && job.anchor_hash32 == wallet_job.anchor_hash32
         && job.target == wallet_job.target
-}
-
-fn same_wallet_job_cache_identity(left: &WalletJob, right: &WalletJob) -> bool {
-    left.height == right.height
-        && left.pow_version == right.pow_version
-        && left.bits == right.bits
-        && left.share_bits == right.share_bits
-        && left.blob == right.blob
-        && left.anchor_hash32 == right.anchor_hash32
-        && left.target == right.target
 }
 
 fn same_worker_partition(job: &WorkJob, nonce_offset: u32, nonce_stride: u32) -> bool {
