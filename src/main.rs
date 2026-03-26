@@ -196,6 +196,7 @@ struct PoolShareEvent<'a> {
 struct App {
     args: Args,
     http: reqwest::Client,
+    submit_http: reqwest::Client,
     seq: Arc<AtomicU64>,
     jobs: Arc<Mutex<HashMap<String, WorkJob>>>,
     wallet_jobs: Arc<Mutex<HashMap<String, WalletJob>>>,
@@ -1054,12 +1055,20 @@ fn is_stale_error_text(message: &str) -> bool {
         || message.contains("stale_job")
         || message.contains("stale_work")
         || message.contains("stale_or_out_of_order_block")
+        || message.contains("unknown_job")
+        || message.contains("wrong_session_job")
+        || message.contains("wrong_worker_id")
 }
 
 fn is_stale_reject_reason(reason: &str) -> bool {
     matches!(
         reason,
-        "stale" | "stale_job" | "stale_work" | "wrong_session_worker"
+        "stale"
+            | "stale_job"
+            | "stale_work"
+            | "wrong_session_worker"
+            | "wrong_session_job"
+            | "wrong_worker_id"
     )
 }
 
@@ -1272,7 +1281,10 @@ fn insert_recent_job(app: &App, job: WorkJob, ttl: Duration) {
         .map(|(id, j)| (id.clone(), j.created_at))
         .collect();
     job_ids.sort_by_key(|(_, created_at)| *created_at);
-    while job_ids.len() > 1 {
+    let keep_recent = ((app.args.job_ttl_secs / app.args.job_refresh_secs.max(1))
+        .clamp(2, 16) as usize)
+        .saturating_add(1);
+    while job_ids.len() > keep_recent {
         let (old_id, _) = job_ids.remove(0);
         if jobs.remove(&old_id).is_some() {
             consumed.insert(
@@ -1596,14 +1608,67 @@ fn wallet_worker_partition(app: &App, wallet: &str, worker_id: &str) -> (u32, u3
     (worker_slot, worker_slots)
 }
 
+fn same_effective_mining_context(
+    height: u64,
+    pow_version: u8,
+    bits: u64,
+    share_bits: u64,
+    anchor_hash32: &str,
+    target: &str,
+    other_height: u64,
+    other_pow_version: u8,
+    other_bits: u64,
+    other_share_bits: u64,
+    other_anchor_hash32: &str,
+    other_target: &str,
+) -> bool {
+    height == other_height
+        && pow_version == other_pow_version
+        && bits == other_bits
+        && share_bits == other_share_bits
+        && anchor_hash32 == other_anchor_hash32
+        && target == other_target
+}
+
 fn same_wallet_job_identity(job: &WorkJob, wallet_job: &WalletJob) -> bool {
-    job.height == wallet_job.height
-        && job.pow_version == wallet_job.pow_version
-        && job.bits == wallet_job.bits
-        && job.share_bits == wallet_job.share_bits
-        && job.blob == wallet_job.blob
-        && job.anchor_hash32 == wallet_job.anchor_hash32
-        && job.target == wallet_job.target
+    same_effective_mining_context(
+        job.height,
+        job.pow_version,
+        job.bits,
+        job.share_bits,
+        &job.anchor_hash32,
+        &job.target,
+        wallet_job.height,
+        wallet_job.pow_version,
+        wallet_job.bits,
+        wallet_job.share_bits,
+        &wallet_job.anchor_hash32,
+        &wallet_job.target,
+    )
+}
+
+fn same_work_job_context(a: &WorkJob, b: &WorkJob) -> bool {
+    same_effective_mining_context(
+        a.height,
+        a.pow_version,
+        a.bits,
+        a.share_bits,
+        &a.anchor_hash32,
+        &a.target,
+        b.height,
+        b.pow_version,
+        b.bits,
+        b.share_bits,
+        &b.anchor_hash32,
+        &b.target,
+    )
+        && same_worker_partition(a, b.nonce_offset, b.nonce_stride)
+}
+
+fn should_push_refreshed_job(current: Option<&WorkJob>, refreshed: &WorkJob) -> bool {
+    current
+        .map(|job| !same_work_job_context(job, refreshed))
+        .unwrap_or(true)
 }
 
 fn same_worker_partition(job: &WorkJob, nonce_offset: u32, nonce_stride: u32) -> bool {
@@ -1616,12 +1681,6 @@ fn current_worker_job(app: &App, session_id: &str, worker_id: &str) -> Option<Wo
         .filter(|job| job.session_id == session_id && job.worker_id == worker_id)
         .max_by_key(|job| job.created_at)
         .cloned()
-}
-
-fn should_push_refreshed_job(current: Option<&WorkJob>, refreshed: &WorkJob) -> bool {
-    current
-        .map(|job| job.job_id != refreshed.job_id)
-        .unwrap_or(true)
 }
 
 async fn refresh_wallet_job(app: &App, wallet: &str) -> Result<WalletJob> {
@@ -1869,7 +1928,7 @@ async fn submit_candidate(
     let started = Instant::now();
     let reply = tokio::time::timeout(
         Duration::from_secs(CANDIDATE_SUBMIT_TIMEOUT_SECS),
-        app.http
+        app.submit_http
             .post(&url)
             .header("x-duta-work-source", "official-stratum")
             .json(&SubmitReq {
@@ -2620,6 +2679,10 @@ async fn main() -> Result<()> {
     let app = App {
         args: args.clone(),
         http,
+        submit_http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(CANDIDATE_SUBMIT_TIMEOUT_SECS + 5))
+            .build()
+            .context("build submit http client")?,
         seq: Arc::new(AtomicU64::new(1)),
         jobs: Arc::new(Mutex::new(HashMap::new())),
         wallet_jobs: Arc::new(Mutex::new(HashMap::new())),
@@ -2785,6 +2848,10 @@ mod tests {
                 network: Some("mainnet".to_string()),
             },
             http: reqwest::Client::new(),
+            submit_http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(CANDIDATE_SUBMIT_TIMEOUT_SECS + 5))
+                .build()
+                .expect("submit client"),
             seq: Arc::new(AtomicU64::new(1)),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             wallet_jobs: Arc::new(Mutex::new(HashMap::new())),
@@ -2948,6 +3015,15 @@ mod tests {
     #[test]
     fn canonical_error_maps_session_worker_to_stale_job() {
         assert_eq!(canonical_stratum_error("wrong_session_worker"), "stale_job");
+    }
+
+    #[test]
+    fn stale_detection_includes_job_session_churn_errors() {
+        assert!(is_stale_error_text("unknown_job"));
+        assert!(is_stale_error_text("wrong_session_job"));
+        assert!(is_stale_error_text("wrong_worker_id"));
+        assert!(is_stale_reject_reason("wrong_session_job"));
+        assert!(is_stale_reject_reason("wrong_worker_id"));
     }
 
     #[test]
@@ -3126,7 +3202,7 @@ mod tests {
     }
 
     #[test]
-    fn newer_job_makes_previous_job_stale_for_same_worker() {
+    fn recent_jobs_for_same_worker_remain_queryable_within_retention_window() {
         let app = test_app();
         let ttl = Duration::from_secs(app.args.job_ttl_secs);
         let base_job = WorkJob {
@@ -3155,9 +3231,43 @@ mod tests {
         insert_recent_job(&app, base_job, ttl);
         insert_recent_job(&app, newer_job, ttl);
 
-        let err = session_job_lookup(&app, "s1", "w1", "job-1").unwrap_err();
-        assert_eq!(err.to_string(), "stale_job");
+        assert!(session_job_lookup(&app, "s1", "w1", "job-1").is_ok());
         assert!(session_job_lookup(&app, "s1", "w1", "job-2").is_ok());
+    }
+
+    #[test]
+    fn oldest_job_expires_once_recent_job_window_is_exceeded() {
+        let app = test_app();
+        let ttl = Duration::from_secs(app.args.job_ttl_secs);
+        let keep_recent = ((app.args.job_ttl_secs / app.args.job_refresh_secs.max(1))
+            .clamp(2, 16) as usize)
+            .saturating_add(1);
+
+        for idx in 0..=keep_recent {
+            let job = WorkJob {
+                job_id: format!("job-{}", idx),
+                session_id: "s1".to_string(),
+                worker_name: "rig1".to_string(),
+                worker_id: "w1".to_string(),
+                wallet: "dut1".to_string(),
+                work_id: format!("work-{}", idx),
+                blob: "00".repeat(80),
+                height: 10,
+                pow_version: dutahash::POW_VERSION_V4,
+                bits: 24,
+                share_bits: 24,
+                anchor_hash32: "00".repeat(32),
+                target: "ff".repeat(32),
+                nonce_offset: 0,
+                nonce_stride: 1,
+                created_at: Instant::now() + Duration::from_millis(idx as u64),
+            };
+            insert_recent_job(&app, job, ttl);
+        }
+
+        let err = session_job_lookup(&app, "s1", "w1", "job-0").unwrap_err();
+        assert_eq!(err.to_string(), "stale_job");
+        assert!(session_job_lookup(&app, "s1", "w1", &format!("job-{}", keep_recent)).is_ok());
     }
 
     #[test]
@@ -3215,7 +3325,7 @@ mod tests {
     }
 
     #[test]
-    fn refreshed_job_pushes_only_when_job_id_changes() {
+    fn refreshed_job_pushes_only_when_effective_mining_context_changes() {
         let current = WorkJob {
             job_id: "job-1".to_string(),
             session_id: "s1".to_string(),
@@ -3244,8 +3354,14 @@ mod tests {
             created_at: Instant::now(),
             ..current.clone()
         };
+        let mut changed_target = current.clone();
+        changed_target.job_id = "job-3".to_string();
+        changed_target.work_id = "work-3".to_string();
+        changed_target.target = "ee".repeat(4);
+        changed_target.created_at = Instant::now();
         assert!(!should_push_refreshed_job(Some(&current), &same));
-        assert!(should_push_refreshed_job(Some(&current), &newer));
+        assert!(!should_push_refreshed_job(Some(&current), &newer));
+        assert!(should_push_refreshed_job(Some(&current), &changed_target));
         assert!(should_push_refreshed_job(None, &newer));
     }
 
