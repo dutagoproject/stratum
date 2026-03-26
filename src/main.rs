@@ -1698,7 +1698,12 @@ async fn refresh_wallet_job(app: &App, wallet: &str) -> Result<WalletJob> {
     let mut jobs = lock_or_recover(&app.wallet_jobs, "wallet_jobs");
     if let Some(existing) = jobs.get(wallet) {
         if same_wallet_job_substantive(existing, &fetched) {
-            return Ok(existing.clone());
+            let refreshed = WalletJob {
+                created_at: Instant::now(),
+                ..existing.clone()
+            };
+            jobs.insert(wallet.to_string(), refreshed.clone());
+            return Ok(refreshed);
         }
     }
     jobs.insert(wallet.to_string(), fetched.clone());
@@ -3378,6 +3383,29 @@ mod tests {
         let mut changed_blob = base.clone();
         changed_blob.bits = 15;
         assert!(!same_wallet_job_substantive(&base, &changed_blob));
+    }
+
+    #[test]
+    fn identical_wallet_work_refresh_should_renew_cache_timestamp() {
+        let old = WalletJob {
+            work_id: "work-1".to_string(),
+            blob: "11".repeat(80),
+            height: 42,
+            pow_version: dutahash::POW_VERSION_V4,
+            bits: 14,
+            share_bits: 24,
+            anchor_hash32: "22".repeat(32),
+            target: "33".repeat(32),
+            created_at: Instant::now() - Duration::from_secs(10),
+        };
+        let fetched_same = WalletJob {
+            work_id: "work-2".to_string(),
+            blob: "44".repeat(80),
+            created_at: Instant::now(),
+            ..old.clone()
+        };
+        assert!(same_wallet_job_substantive(&old, &fetched_same));
+        assert!(fetched_same.created_at > old.created_at);
     }
 
     #[test]
