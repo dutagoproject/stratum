@@ -27,7 +27,7 @@ use tokio::{
     },
 };
 
-const RELEASE_VERSION: &str = "1.0.2-v4.1-rc1";
+const RELEASE_VERSION: &str = "1.0.3";
 
 #[derive(Parser, Debug, Clone)]
 #[command(
