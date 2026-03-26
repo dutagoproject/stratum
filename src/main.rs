@@ -1534,14 +1534,6 @@ async fn fetch_work(
         nonce_stride: 1,
         created_at: Instant::now(),
     };
-    log_net(format!(
-        "new work wallet={} height={} block_bits={} share_bits={} wallet_hs={}",
-        short_wallet(wallet),
-        job.height,
-        job.bits,
-        job.share_bits,
-        format_hashrate(wallet_hs),
-    ));
     Ok(job)
 }
 
@@ -1647,6 +1639,23 @@ fn same_wallet_job_identity(job: &WorkJob, wallet_job: &WalletJob) -> bool {
     )
 }
 
+fn same_wallet_job_substantive(a: &WalletJob, b: &WalletJob) -> bool {
+    same_effective_mining_context(
+        a.height,
+        a.pow_version,
+        a.bits,
+        a.share_bits,
+        &a.anchor_hash32,
+        &a.target,
+        b.height,
+        b.pow_version,
+        b.bits,
+        b.share_bits,
+        &b.anchor_hash32,
+        &b.target,
+    )
+}
+
 fn same_work_job_context(a: &WorkJob, b: &WorkJob) -> bool {
     same_effective_mining_context(
         a.height,
@@ -1685,10 +1694,23 @@ fn current_worker_job(app: &App, session_id: &str, worker_id: &str) -> Option<Wo
 
 async fn refresh_wallet_job(app: &App, wallet: &str) -> Result<WalletJob> {
     let work = fetch_work(app, wallet).await?;
-    let wallet_job = wallet_job_from_work(&work);
+    let fetched = wallet_job_from_work(&work);
     let mut jobs = lock_or_recover(&app.wallet_jobs, "wallet_jobs");
-    jobs.insert(wallet.to_string(), wallet_job.clone());
-    Ok(wallet_job)
+    if let Some(existing) = jobs.get(wallet) {
+        if same_wallet_job_substantive(existing, &fetched) {
+            return Ok(existing.clone());
+        }
+    }
+    jobs.insert(wallet.to_string(), fetched.clone());
+    log_net(format!(
+        "new work wallet={} height={} block_bits={} share_bits={} wallet_hs={}",
+        short_wallet(wallet),
+        fetched.height,
+        fetched.bits,
+        fetched.share_bits,
+        format_hashrate(estimated_wallet_hashrate(app, wallet)),
+    ));
+    Ok(fetched)
 }
 
 async fn refresh_wallet_job_after_candidate(
@@ -2105,6 +2127,7 @@ async fn handle_getjob(app: &App, session_id: &str, params: &Value) -> Result<Va
             .map(|s| s.peer_label.clone())
             .unwrap_or_else(|| "-".to_string())
     };
+    let current = current_worker_job(app, session_id, worker_id);
 
     match assign_work(
         app,
@@ -2119,17 +2142,23 @@ async fn handle_getjob(app: &App, session_id: &str, params: &Value) -> Result<Va
     {
         Ok(job) => {
             insert_recent_job(app, job.clone(), Duration::from_secs(app.args.job_ttl_secs));
-            log_job(format!(
-                "new work assigned peer={} wallet={} worker={} height={} block_bits={} share_bits={} job={} work={}",
-                short_peer_label(&peer_label),
-                short_wallet(&wallet),
-                worker_tag(&worker_name),
-                job.height,
-                job.bits,
-                job.share_bits,
-                job.job_id,
-                short_id(&job.work_id)
-            ));
+            let same_job = current
+                .as_ref()
+                .map(|cur| cur.job_id == job.job_id)
+                .unwrap_or(false);
+            if !same_job {
+                log_job(format!(
+                    "new work assigned peer={} wallet={} worker={} height={} block_bits={} share_bits={} job={} work={}",
+                    short_peer_label(&peer_label),
+                    short_wallet(&wallet),
+                    worker_tag(&worker_name),
+                    job.height,
+                    job.bits,
+                    job.share_bits,
+                    job.job_id,
+                    short_id(&job.work_id)
+                ));
+            }
             Ok(json!({"status": "OK", "job": job_json(&job)}))
         }
         Err(err) => {
@@ -3325,6 +3354,33 @@ mod tests {
     }
 
     #[test]
+    fn same_wallet_job_substantive_ignores_work_id_churn() {
+        let base = WalletJob {
+            work_id: "work-1".to_string(),
+            blob: "11".repeat(80),
+            height: 42,
+            pow_version: dutahash::POW_VERSION_V4,
+            bits: 14,
+            share_bits: 24,
+            anchor_hash32: "22".repeat(32),
+            target: "33".repeat(32),
+            created_at: Instant::now(),
+        };
+        let mut same = base.clone();
+        same.work_id = "work-2".to_string();
+        same.created_at = Instant::now() + Duration::from_secs(2);
+        assert!(same_wallet_job_substantive(&base, &same));
+
+        let mut same_blob_changed = same.clone();
+        same_blob_changed.blob = "44".repeat(80);
+        assert!(same_wallet_job_substantive(&base, &same_blob_changed));
+
+        let mut changed_blob = base.clone();
+        changed_blob.bits = 15;
+        assert!(!same_wallet_job_substantive(&base, &changed_blob));
+    }
+
+    #[test]
     fn refreshed_job_pushes_only_when_effective_mining_context_changes() {
         let current = WorkJob {
             job_id: "job-1".to_string(),
@@ -3363,6 +3419,33 @@ mod tests {
         assert!(!should_push_refreshed_job(Some(&current), &newer));
         assert!(should_push_refreshed_job(Some(&current), &changed_target));
         assert!(should_push_refreshed_job(None, &newer));
+    }
+
+    #[test]
+    fn same_job_id_is_not_a_new_assignment() {
+        let current = WorkJob {
+            job_id: "job-1".to_string(),
+            session_id: "s1".to_string(),
+            worker_name: "rig1".to_string(),
+            worker_id: "w1".to_string(),
+            wallet: "dut1".to_string(),
+            work_id: "work-1".to_string(),
+            blob: "11".repeat(80),
+            height: 42,
+            pow_version: dutahash::POW_VERSION_V4,
+            bits: 14,
+            share_bits: 24,
+            anchor_hash32: "22".repeat(32),
+            target: "33".repeat(32),
+            nonce_offset: 0,
+            nonce_stride: 1,
+            created_at: Instant::now(),
+        };
+        let refreshed_same_job = WorkJob {
+            created_at: Instant::now() + Duration::from_secs(1),
+            ..current.clone()
+        };
+        assert_eq!(current.job_id, refreshed_same_job.job_id);
     }
 
     #[test]
