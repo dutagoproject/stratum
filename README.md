@@ -4,12 +4,13 @@
 
 It sits between miners and the daemon mining API, handles worker sessions, distributes jobs, validates shares, and submits block candidates upstream.
 
-Current release line: `1.0.2`
+Current release line: `1.0.3`
 
-Release `1.0.2` focus:
+Release `1.0.3` focus:
 
-- stale worker job windows are reduced so miners move to fresh upstream work faster
-- active workers receive refreshed jobs proactively instead of waiting on slow cache reuse alone
+- submit/session churn handling is more stable under rapid job refresh
+- identical wallet work is no longer re-announced as if it were new work
+- public peer behavior on the backing daemon side is now hard enough that stratum burn-in can run against a cleaner chain
 
 Website: https://dutago.xyz
 
@@ -45,3 +46,4 @@ This repo is for operators who want to run a public DUTA stratum endpoint or con
 - Windows build: [docs/BUILD_WINDOWS.md](./docs/BUILD_WINDOWS.md)
 - Deployment guide: [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md)
 - Install from binary: [docs/INSTALL_FROM_BINARY.md](./docs/INSTALL_FROM_BINARY.md)
+- Historical beta notes: [docs/RELEASE_DOWNLOAD_0.0.1-beta.md](./docs/RELEASE_DOWNLOAD_0.0.1-beta.md)

@@ -15,15 +15,15 @@ For each final release, download the bundle that matches your platform:
 
 Also keep:
 
-- `manifest.json`
-- `sha256sums.txt`
+- `SHA256SUMS.txt`
+- the release notes or upgrade notes that came with the bundle
 
 ## Verify the checksums
 
 On Linux:
 
 ```bash
-sha256sum -c sha256sums.txt
+sha256sum -c SHA256SUMS.txt
 ```
 
 On Windows:
@@ -35,8 +35,8 @@ certutil -hashfile duta-stratumd.exe SHA256
 ## Linux install example
 
 ```bash
-tar -xzf duta-stratum-1.0.0-linux-x86_64.tar.gz
-cd duta-stratum-1.0.0-linux-x86_64
+tar -xzf duta-stratum-1.0.3-linux-x86_64.tar.gz
+cd duta-stratum-1.0.3-linux-x86_64
 install -m 0755 duta-stratumd /usr/local/bin/duta-stratumd
 ```
 
@@ -73,3 +73,4 @@ C:\DUTA\stratum\duta-stratumd.exe
 - point stratum to the daemon mining listener, not the admin RPC
 - use a public bind only if you really intend to expose the endpoint
 - verify logs after deployment for stable login, work refresh, and accepted shares
+- after upgrade, confirm the binary reports `duta-stratumd 1.0.3`
